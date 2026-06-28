@@ -121,14 +121,23 @@ impl Dji {
                         }
 
                         let v = serde_json::to_value(&clip).map_err(|_| Error::new(ErrorKind::Other, "Serialize error"));
-                        if let Ok(vv) = v {
+                        if let Ok(mut vv) = v {
+                            // Inject pano_dewarp_params from stream_meta into metadata JSON
+                            // so downstream can extract dual-lens calibration for panoramic cameras (e.g. oq101 / Osmo 360).
+                            if let Some(stream) = &$parsed.stream_meta {
+                                if let Some(meta) = &stream.video_stream_meta {
+                                    fps = meta.framerate as f64;
+                                }
+                                if let Ok(stream_json) = serde_json::to_value(stream) {
+                                    if let Some(pano) = stream_json.get("pano_dewarp_params").cloned() {
+                                        if let Some(obj) = vv.as_object_mut() {
+                                            obj.insert("pano_dewarp_params".to_string(), pano);
+                                        }
+                                    }
+                                }
+                            }
                             log::debug!("Metadata: {:?}", &vv);
                             insert_tag(&mut tag_map, tag!(parsed GroupId::Default, TagId::Metadata, "Metadata", Json, |v| serde_json::to_string(v).unwrap(), vv, vec![]), &options);
-                        }
-                        if let Some(ref stream) = $parsed.stream_meta {
-                            if let Some(ref meta) = stream.video_stream_meta {
-                                fps = meta.framerate as f64;
-                            }
                         }
                         if let Some(ref mut v) = self.frame_readout_time {
                             *v /= fps / sensor_fps;
