@@ -385,60 +385,68 @@ impl GoPro {
     /// Insta360 / gyroflow. Non-GoPro brands are untouched.
     fn process_gps_samples(samples: &mut Vec<SampleInfo>, i: usize, options: &crate::InputOptions) {
         let info = &samples[i];
-        let tag_map = match info.tag_map.as_ref() {
-            Some(m) => m,
-            None => return,
-        };
-        let gps_map = match tag_map.get(&GroupId::GPS) {
-            Some(m) => m,
-            None => return,
-        };
-        // Find the raw GPS5 / GPS9 descriptor (both land under TagId::Data
-        // per klv.rs, disambiguated by the FourCC in `description`).
-        let data_desc = match gps_map.get(&TagId::Data) {
-            Some(d) => d,
-            None => return,
-        };
-        let (rows, is_gps9) = match (&data_desc.value, data_desc.description.as_str()) {
-            (TagValue::Vec_Vec_i32(v), "GPS5") => (v.get(), false),
-            (TagValue::Vec_Vec_i32(v), "GPS9") => (v.get(), true),
-            // Already post-processed (Vec_GpsData) or a different producer.
-            _ => return,
-        };
+        let Some(tag_map) = info.tag_map.as_ref() else { return; };
+        let Some(gps_map) = tag_map.get(&GroupId::GPS) else { return; };
+        let Some(data_desc) = gps_map.get(&TagId::Data) else { return; };
 
-        // SCAL divisors — GoPro authoritative layout:
-        //   GPS5: [1e7, 1e7, 1e3, 1e3, 1e2]   (lat, lon, alt, spd2d, spd3d)
-        //   GPS9: [1e7, 1e7, 1e3, 1e3, 1e3, 1, 1e3, 1e2, 1]
-        //         (lat, lon, alt, spd2d, spd3d, days, secs*1e3, DOP, fix)
-        // Read whatever the file shipped and fall back to spec defaults so
-        // synthetic tests don't need to author SCAL.
-        let scal: Vec<f64> = match &gps_map.get(&TagId::Scale).map(|d| &d.value) {
+        // GPS5 (legacy: `data_type=b'l'` homogeneous i32) lands as
+        // `Vec_Vec_i32`. GPS9 (HERO11+: `data_type=b'?'` heterogeneous
+        // struct with a preceding `TYPE` descriptor) lands as
+        // `Vec_Vec_Scalar` because its columns mix i32/u32/u16/etc. We
+        // normalise both into `Vec<Vec<i64>>` so the downstream scaling
+        // logic doesn't care.
+        let (rows, is_gps9): (Vec<Vec<i64>>, bool) =
+            match (&data_desc.value, data_desc.description.as_str()) {
+                (TagValue::Vec_Vec_i32(v), "GPS5") => (
+                    v.get().iter().map(|r| r.iter().map(|x| *x as i64).collect()).collect(),
+                    false,
+                ),
+                (TagValue::Vec_Vec_i32(v), "GPS9") => (
+                    v.get().iter().map(|r| r.iter().map(|x| *x as i64).collect()).collect(),
+                    true,
+                ),
+                (TagValue::Vec_Vec_Scalar(v), "GPS9") => (
+                    v.get()
+                        .iter()
+                        .map(|r| r.iter().map(Self::scalar_to_i64).collect())
+                        .collect(),
+                    true,
+                ),
+                _ => return,
+            };
+
+        if rows.is_empty() {
+            return;
+        }
+
+        // SCAL divisors. Read the file's own SCAL; default to spec values
+        // per column when absent so synthetic tests without SCAL still work.
+        let scal: Vec<f64> = match gps_map.get(&TagId::Scale).map(|d| &d.value) {
             Some(TagValue::Vec_i32(v)) => v.get().iter().map(|x| *x as f64).collect(),
             Some(TagValue::Vec_u32(v)) => v.get().iter().map(|x| *x as f64).collect(),
+            Some(TagValue::Vec_i16(v)) => v.get().iter().map(|x| *x as f64).collect(),
+            Some(TagValue::Vec_u16(v)) => v.get().iter().map(|x| *x as f64).collect(),
+            Some(TagValue::Vec_Scalar(v)) => v.get().iter().map(Self::scalar_to_f64).collect(),
             _ => Vec::new(),
         };
         let scale = |col: usize, default: f64| -> f64 {
             scal.get(col).copied().filter(|v| *v > 0.0).unwrap_or(default)
         };
 
-        // GPSU (frame-level UTC, ms since epoch) — GPS5 only. GPS9 carries
-        // days + secs-since-midnight per row.
+        // GPSU: frame-level UTC (ms since Unix epoch, u64 from KLV 'U').
+        // GPS5 only — GPS9 has per-row timestamps.
         const GPSU_FOURCC: u32 = u32::from_be_bytes(*b"GPSU");
+        // GPSF: fix status. 0 = no lock, 2 = 2D, 3 = 3D. u32.
         const GPSF_FOURCC: u32 = u32::from_be_bytes(*b"GPSF");
-        let gpsu_ms: Option<u64> = gps_map
-            .get_t(TagId::Unknown(GPSU_FOURCC))
-            .copied();
-        // GPSF: 0 = no lock, 2 = 2D lock, 3 = 3D lock (u32 in the file).
-        let gpsf: Option<u32> = gps_map
-            .get_t(TagId::Unknown(GPSF_FOURCC))
-            .copied();
+        let gpsu_ms: Option<u64> = gps_map.get_t(TagId::Unknown(GPSU_FOURCC)).copied();
+        let gpsf: Option<u32> = gps_map.get_t(TagId::Unknown(GPSF_FOURCC)).copied();
 
-        // 2000-01-01T00:00:00Z in Unix epoch seconds — GPS9 origin.
+        // 2000-01-01T00:00:00Z as Unix epoch — GPS9 origin.
         const EPOCH_2000_UNIX_S: i64 = 946_684_800;
 
         let mut gps = Vec::with_capacity(rows.len());
-        for row in rows {
-            let (needed, is_2d_only) = if is_gps9 { (9, false) } else { (5, true) };
+        for row in &rows {
+            let needed = if is_gps9 { 9 } else { 5 };
             if row.len() < needed {
                 continue;
             }
@@ -446,23 +454,22 @@ impl GoPro {
             let lat = row[0] as f64 / scale(0, 1e7);
             let lon = row[1] as f64 / scale(1, 1e7);
             let alt = row[2] as f64 / scale(2, 1e3);
-            // 2D speed for GpsData.speed; 3D goes unused.
             let speed = row[3] as f64 / scale(3, 1e3);
 
             let (unix_ts_s, acquired) = if is_gps9 {
-                let days = row[5] as i64;
+                let days = row[5];
                 let secs_ms = row[6] as f64 / scale(6, 1e3);
-                let fix = row[8];
+                let fix_col = row[8];
                 let t = EPOCH_2000_UNIX_S as f64 + days as f64 * 86_400.0 + secs_ms;
-                (t, fix >= 2)
+                // HERO11 sometimes emits row[8]=0 and relies on the
+                // frame-level GPSF for lock status. Accept a row if
+                // EITHER source reports 2D/3D lock.
+                let acquired = fix_col >= 2 || gpsf.map(|f| f >= 2).unwrap_or(false);
+                (t, acquired)
             } else {
-                // GPS5: no per-row fix in-band; use frame-level GPSF and
-                // GPSU. All fixes in this frame share the timestamp.
                 let t = gpsu_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
                 (t, gpsf.map(|f| f >= 2).unwrap_or(t > 0.0))
             };
-
-            let _ = is_2d_only; // reserved for future 2D/3D distinction
 
             gps.push(GpsData {
                 is_acquired: acquired,
@@ -475,19 +482,50 @@ impl GoPro {
             });
         }
 
-        // Convert km/h ↔ m/s? tags_impl.rs:352 GpsData::speed is documented
-        // as "in km/h", but Insta360 (record.rs) stores raw NMEA knots and
-        // CAMM stores m/s — the unit is currently producer-defined. GoPro
-        // SCAL yields m/s (1e3), which matches CAMM. Leaving as-is; a
-        // consumer aggregating across producers is already responsible
-        // for unit reconciliation.
-
         let grouped_tag_map = samples[i].tag_map.as_mut().unwrap();
         util::insert_tag(
             grouped_tag_map,
             tag!(parsed GroupId::GPS, TagId::Data, "GPS data", Vec_GpsData, |v| format!("{:?}", v), gps, vec![]),
             options,
         );
+    }
+
+    /// Extract an i64 out of a `Scalar` — the KLV parser's canonical
+    /// heterogeneous value cell. Every integer variant widens losslessly
+    /// to i64; floats truncate toward zero (acceptable for the DOP/fix
+    /// columns where fractional values don't occur in practice).
+    fn scalar_to_i64(s: &Scalar) -> i64 {
+        match *s {
+            Scalar::i8(v)  => v as i64,
+            Scalar::u8(v)  => v as i64,
+            Scalar::i16(v) => v as i64,
+            Scalar::u16(v) => v as i64,
+            Scalar::i32(v) => v as i64,
+            Scalar::u32(v) => v as i64,
+            Scalar::i64(v) => v,
+            Scalar::u64(v) => v as i64,
+            Scalar::f32(v) => v as i64,
+            Scalar::f64(v) => v as i64,
+            _ => 0,
+        }
+    }
+
+    /// Same widening for scaling factors — SCAL values are typically
+    /// small positive integers, so f64 is exact.
+    fn scalar_to_f64(s: &Scalar) -> f64 {
+        match *s {
+            Scalar::i8(v)  => v as f64,
+            Scalar::u8(v)  => v as f64,
+            Scalar::i16(v) => v as f64,
+            Scalar::u16(v) => v as f64,
+            Scalar::i32(v) => v as f64,
+            Scalar::u32(v) => v as f64,
+            Scalar::i64(v) => v as f64,
+            Scalar::u64(v) => v as f64,
+            Scalar::f32(v) => v as f64,
+            Scalar::f64(v) => v,
+            _ => 0.0,
+        }
     }
     pub fn get_avg_sample_duration(samples: &Vec<SampleInfo>, group_id: &GroupId) -> Option<f64> {
         let mut total_duration_ms = 0.0;
@@ -564,6 +602,7 @@ mod tests {
     fn fmt_vec_i32(v: &Vec<i32>) -> String { format!("{:?}", v) }
     fn fmt_u64(v: &u64) -> String { format!("{}", v) }
     fn fmt_u32(v: &u32) -> String { format!("{}", v) }
+    fn fmt_vec_vec_scalar(v: &Vec<Vec<Scalar>>) -> String { format!("{:?}", v) }
 
     fn make_sample(tags: Vec<(GroupId, TagId, String, TagValue)>) -> util::SampleInfo {
         let mut map: GroupedTagMap = BTreeMap::new();
@@ -672,5 +711,53 @@ mod tests {
         GoPro::process_gps_samples(&mut samples, 0, &crate::InputOptions::default());
         let map = samples[0].tag_map.as_ref().unwrap();
         assert!(map.get(&GroupId::GPS).is_none(), "no GPS group should stay absent");
+    }
+
+    /// Real HERO11 firmware emits GPS9 as `Vec_Vec_Scalar` because the
+    /// KLV parser dispatches on `data_type = b'?'` (heterogeneous struct
+    /// preceded by a TYPE descriptor). This test covers the production
+    /// wire shape — synthetic i32 rows are handy but don't exercise the
+    /// path real files take.
+    #[test]
+    fn process_gps_samples_gps9_vec_vec_scalar() {
+        // Same numeric content as the Vec_Vec_i32 GPS9 test, but wrapped
+        // in Scalar so the (TagValue::Vec_Vec_Scalar, "GPS9") arm fires.
+        // Column 8 (fix) demonstrates u32 → i64 widening.
+        let scalar_row = |lat: i32, lon: i32, alt: i32, s2d: i32, s3d: i32,
+                          days: i32, ms: i32, dop: i32, fix: u32| -> Vec<Scalar> {
+            vec![
+                Scalar::i32(lat), Scalar::i32(lon), Scalar::i32(alt),
+                Scalar::i32(s2d), Scalar::i32(s3d),
+                Scalar::i32(days), Scalar::i32(ms),
+                Scalar::i32(dop), Scalar::u32(fix),
+            ]
+        };
+        let rows = vec![
+            scalar_row(312_304_000, 1_214_737_000, 10_000, 5_000, 5_100, 8718, 44_800_000, 100, 3),
+            scalar_row(0, 0, 0, 0, 0, 8718, 44_800_100, 100, 0),
+            scalar_row(312_305_000, 1_214_738_000, 11_000, 4_500, 4_600, 8718, 44_800_200, 100, 3),
+        ];
+        let mut samples = vec![make_sample(vec![
+            (GroupId::GPS, TagId::Data, "GPS9".into(),
+                TagValue::Vec_Vec_Scalar(ValueType::new_parsed(fmt_vec_vec_scalar, rows, vec![]))),
+            (GroupId::GPS, TagId::Scale, "SCAL".into(),
+                TagValue::Vec_i32(ValueType::new_parsed(fmt_vec_i32,
+                    vec![10_000_000, 10_000_000, 1_000, 1_000, 1_000, 1, 1_000, 100, 1],
+                    vec![]))),
+        ])];
+
+        GoPro::process_gps_samples(&mut samples, 0, &crate::InputOptions::default());
+
+        let map = samples[0].tag_map.as_ref().unwrap();
+        let gps_map = map.get(&GroupId::GPS).unwrap();
+        let out: &Vec<GpsData> = gps_map.get_t(TagId::Data).expect("GPS Vec_GpsData missing");
+        assert_eq!(out.len(), 3, "Vec_Vec_Scalar path must produce every row");
+        assert!(out[0].is_acquired, "fix=3 in Scalar::u32 must widen and gate correctly");
+        assert!(!out[1].is_acquired, "fix=0 → not acquired even in Scalar form");
+        assert!(out[2].is_acquired);
+        assert!((out[0].lat - 31.2304).abs() < 1e-9);
+        assert!((out[0].lon - 121.4737).abs() < 1e-9);
+        assert!((out[0].altitude - 10.0).abs() < 1e-9);
+        assert!((out[0].unix_timestamp - 1_699_964_800.0).abs() < 1e-3);
     }
 }
