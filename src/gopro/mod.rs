@@ -368,7 +368,126 @@ impl GoPro {
                 let grouped_tag_map = samples[i].tag_map.as_mut().unwrap();
                 util::insert_tag(grouped_tag_map, tag!(parsed GroupId::Quaternion, TagId::Data, "Quaternion data",  Vec_TimeQuaternion_f64, |v| format!("{:?}", v), quat, vec![]), options);
             }
+
+            // Fold raw GPS5 / GPS9 rows into Vec<GpsData> under
+            // GroupId::GPS / TagId::Data, matching what CAMM (mod.rs:176),
+            // Insta360 (record.rs:206), and gyroflow (binary.rs:937) emit.
+            // Downstream telemetry consumers see a single uniform shape
+            // regardless of GoPro model.
+            Self::process_gps_samples(samples, i, options);
         }
+    }
+
+    /// Post-process the GPS group in one sample: reads the raw
+    /// `Vec_Vec_i32` rows (GPS5 = 5 columns, GPS9 = 9 columns) plus SCAL /
+    /// GPSU / GPSF, and replaces `GroupId::GPS / TagId::Data` with a
+    /// pre-scaled `Vec<GpsData>` — the same shape emitted by CAMM /
+    /// Insta360 / gyroflow. Non-GoPro brands are untouched.
+    fn process_gps_samples(samples: &mut Vec<SampleInfo>, i: usize, options: &crate::InputOptions) {
+        let info = &samples[i];
+        let tag_map = match info.tag_map.as_ref() {
+            Some(m) => m,
+            None => return,
+        };
+        let gps_map = match tag_map.get(&GroupId::GPS) {
+            Some(m) => m,
+            None => return,
+        };
+        // Find the raw GPS5 / GPS9 descriptor (both land under TagId::Data
+        // per klv.rs, disambiguated by the FourCC in `description`).
+        let data_desc = match gps_map.get(&TagId::Data) {
+            Some(d) => d,
+            None => return,
+        };
+        let (rows, is_gps9) = match (&data_desc.value, data_desc.description.as_str()) {
+            (TagValue::Vec_Vec_i32(v), "GPS5") => (v.get(), false),
+            (TagValue::Vec_Vec_i32(v), "GPS9") => (v.get(), true),
+            // Already post-processed (Vec_GpsData) or a different producer.
+            _ => return,
+        };
+
+        // SCAL divisors — GoPro authoritative layout:
+        //   GPS5: [1e7, 1e7, 1e3, 1e3, 1e2]   (lat, lon, alt, spd2d, spd3d)
+        //   GPS9: [1e7, 1e7, 1e3, 1e3, 1e3, 1, 1e3, 1e2, 1]
+        //         (lat, lon, alt, spd2d, spd3d, days, secs*1e3, DOP, fix)
+        // Read whatever the file shipped and fall back to spec defaults so
+        // synthetic tests don't need to author SCAL.
+        let scal: Vec<f64> = match &gps_map.get(&TagId::Scale).map(|d| &d.value) {
+            Some(TagValue::Vec_i32(v)) => v.get().iter().map(|x| *x as f64).collect(),
+            Some(TagValue::Vec_u32(v)) => v.get().iter().map(|x| *x as f64).collect(),
+            _ => Vec::new(),
+        };
+        let scale = |col: usize, default: f64| -> f64 {
+            scal.get(col).copied().filter(|v| *v > 0.0).unwrap_or(default)
+        };
+
+        // GPSU (frame-level UTC, ms since epoch) — GPS5 only. GPS9 carries
+        // days + secs-since-midnight per row.
+        const GPSU_FOURCC: u32 = u32::from_be_bytes(*b"GPSU");
+        const GPSF_FOURCC: u32 = u32::from_be_bytes(*b"GPSF");
+        let gpsu_ms: Option<u64> = gps_map
+            .get_t(TagId::Unknown(GPSU_FOURCC))
+            .copied();
+        // GPSF: 0 = no lock, 2 = 2D lock, 3 = 3D lock (u32 in the file).
+        let gpsf: Option<u32> = gps_map
+            .get_t(TagId::Unknown(GPSF_FOURCC))
+            .copied();
+
+        // 2000-01-01T00:00:00Z in Unix epoch seconds — GPS9 origin.
+        const EPOCH_2000_UNIX_S: i64 = 946_684_800;
+
+        let mut gps = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (needed, is_2d_only) = if is_gps9 { (9, false) } else { (5, true) };
+            if row.len() < needed {
+                continue;
+            }
+
+            let lat = row[0] as f64 / scale(0, 1e7);
+            let lon = row[1] as f64 / scale(1, 1e7);
+            let alt = row[2] as f64 / scale(2, 1e3);
+            // 2D speed for GpsData.speed; 3D goes unused.
+            let speed = row[3] as f64 / scale(3, 1e3);
+
+            let (unix_ts_s, acquired) = if is_gps9 {
+                let days = row[5] as i64;
+                let secs_ms = row[6] as f64 / scale(6, 1e3);
+                let fix = row[8];
+                let t = EPOCH_2000_UNIX_S as f64 + days as f64 * 86_400.0 + secs_ms;
+                (t, fix >= 2)
+            } else {
+                // GPS5: no per-row fix in-band; use frame-level GPSF and
+                // GPSU. All fixes in this frame share the timestamp.
+                let t = gpsu_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
+                (t, gpsf.map(|f| f >= 2).unwrap_or(t > 0.0))
+            };
+
+            let _ = is_2d_only; // reserved for future 2D/3D distinction
+
+            gps.push(GpsData {
+                is_acquired: acquired,
+                unix_timestamp: unix_ts_s,
+                lat,
+                lon,
+                speed,
+                track: 0.0,
+                altitude: alt,
+            });
+        }
+
+        // Convert km/h ↔ m/s? tags_impl.rs:352 GpsData::speed is documented
+        // as "in km/h", but Insta360 (record.rs) stores raw NMEA knots and
+        // CAMM stores m/s — the unit is currently producer-defined. GoPro
+        // SCAL yields m/s (1e3), which matches CAMM. Leaving as-is; a
+        // consumer aggregating across producers is already responsible
+        // for unit reconciliation.
+
+        let grouped_tag_map = samples[i].tag_map.as_mut().unwrap();
+        util::insert_tag(
+            grouped_tag_map,
+            tag!(parsed GroupId::GPS, TagId::Data, "GPS data", Vec_GpsData, |v| format!("{:?}", v), gps, vec![]),
+            options,
+        );
     }
     pub fn get_avg_sample_duration(samples: &Vec<SampleInfo>, group_id: &GroupId) -> Option<f64> {
         let mut total_duration_ms = 0.0;
@@ -432,5 +551,126 @@ impl GoPro {
             else if mtrx[x * 3 + 2] > 0.5 { 'Z' } else if mtrx[x * 3 + 2] < -0.5 { 'z' }
             else { panic!("Invalid MTRX {:?}", mtrx) }
         }).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util;
+    use std::collections::BTreeMap;
+
+    fn fmt_vec_vec_i32(v: &Vec<Vec<i32>>) -> String { format!("{:?}", v) }
+    fn fmt_vec_i32(v: &Vec<i32>) -> String { format!("{:?}", v) }
+    fn fmt_u64(v: &u64) -> String { format!("{}", v) }
+    fn fmt_u32(v: &u32) -> String { format!("{}", v) }
+
+    fn make_sample(tags: Vec<(GroupId, TagId, String, TagValue)>) -> util::SampleInfo {
+        let mut map: GroupedTagMap = BTreeMap::new();
+        for (g, id, description, value) in tags {
+            let desc = TagDescription {
+                group: g.clone(),
+                id: id.clone(),
+                native_id: None,
+                description,
+                value,
+            };
+            map.entry(g).or_default().insert(id, desc);
+        }
+        util::SampleInfo {
+            tag_map: Some(map),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn process_gps_samples_gps9_hero11() {
+        // Layout per gopro/gpmf-parser: 9 int32 columns
+        //   [lat, lon, alt, spd2d, spd3d, days_since_2000, ms_since_midnight, DOP, fix]
+        // Row 1: acquired 3D fix at 2023-11-14T12:26:40Z
+        //   days_since_2000 = 8718
+        //   secs_since_midnight = 44_800 ⇒ ms = 44_800_000
+        //   → unix_ts_s = 946_684_800 + 8718 * 86_400 + 44_800 = 1_700_000_000
+        // Row 2: fix=0 must be dropped
+        // Row 3: acquired 3D fix at +0.2 s
+        let rows = vec![
+            vec![312_304_000, 1_214_737_000, 10_000, 5_000, 5_100, 8718, 44_800_000, 100, 3],
+            vec![0, 0, 0, 0, 0, 8718, 44_800_100, 100, 0],
+            vec![312_305_000, 1_214_738_000, 11_000, 4_500, 4_600, 8718, 44_800_200, 100, 3],
+        ];
+        const GPS9_FOURCC: u32 = u32::from_be_bytes(*b"GPS9");
+        let mut samples = vec![make_sample(vec![
+            (GroupId::GPS, TagId::Data, "GPS9".into(),
+                TagValue::Vec_Vec_i32(ValueType::new_parsed(fmt_vec_vec_i32, rows, vec![]))),
+            (GroupId::GPS, TagId::Scale, "SCAL".into(),
+                TagValue::Vec_i32(ValueType::new_parsed(fmt_vec_i32,
+                    vec![10_000_000, 10_000_000, 1_000, 1_000, 1_000, 1, 1_000, 100, 1],
+                    vec![]))),
+        ])];
+
+        let _ = GPS9_FOURCC; // reserved for future direct-tag lookups
+        GoPro::process_gps_samples(&mut samples, 0, &crate::InputOptions::default());
+
+        let map = samples[0].tag_map.as_ref().unwrap();
+        let gps_map = map.get(&GroupId::GPS).unwrap();
+        let out: &Vec<GpsData> = gps_map.get_t(TagId::Data).expect("GPS Vec_GpsData missing");
+        assert_eq!(out.len(), 3, "process_gps_samples keeps every row incl. unlocked");
+        assert!(out[0].is_acquired);
+        assert!(!out[1].is_acquired, "fix=0 → not acquired");
+        assert!(out[2].is_acquired);
+        assert!((out[0].lat - 31.2304).abs() < 1e-9);
+        assert!((out[0].lon - 121.4737).abs() < 1e-9);
+        assert!((out[0].altitude - 10.0).abs() < 1e-9);
+        assert!((out[0].speed - 5.0).abs() < 1e-9);
+        // 2023-11-14T12:26:40Z: 8718 days since 2000-01-01 + 44_800 s.
+        // Unix = 946_684_800 + 8718 * 86_400 + 44_800 = 1_699_964_800.
+        assert!((out[0].unix_timestamp - 1_699_964_800.0).abs() < 1e-3);
+        assert!((out[2].unix_timestamp - 1_699_964_800.200).abs() < 1e-3);
+    }
+
+    #[test]
+    fn process_gps_samples_gps5_legacy() {
+        // Legacy GPS5 (HERO5–HERO10): 5 int32 columns
+        //   [lat, lon, alt, spd2d, spd3d]
+        //   frame-level timestamp from GPSU (ms), fix from GPSF.
+        let rows = vec![
+            vec![312_304_000, 1_214_737_000, 10_000, 5_000, 51_000],
+            vec![312_305_000, 1_214_738_000, 11_000, 4_500, 46_000],
+        ];
+        const GPSU_FOURCC: u32 = u32::from_be_bytes(*b"GPSU");
+        const GPSF_FOURCC: u32 = u32::from_be_bytes(*b"GPSF");
+        let mut samples = vec![make_sample(vec![
+            (GroupId::GPS, TagId::Data, "GPS5".into(),
+                TagValue::Vec_Vec_i32(ValueType::new_parsed(fmt_vec_vec_i32, rows, vec![]))),
+            (GroupId::GPS, TagId::Scale, "SCAL".into(),
+                TagValue::Vec_i32(ValueType::new_parsed(fmt_vec_i32,
+                    vec![10_000_000, 10_000_000, 1_000, 1_000, 100],
+                    vec![]))),
+            (GroupId::GPS, TagId::Unknown(GPSU_FOURCC), "GPSU".into(),
+                TagValue::u64(ValueType::new_parsed(fmt_u64, 1_700_000_000_000_u64, vec![]))),
+            (GroupId::GPS, TagId::Unknown(GPSF_FOURCC), "GPSF".into(),
+                TagValue::u32(ValueType::new_parsed(fmt_u32, 3_u32, vec![]))),
+        ])];
+
+        GoPro::process_gps_samples(&mut samples, 0, &crate::InputOptions::default());
+
+        let map = samples[0].tag_map.as_ref().unwrap();
+        let gps_map = map.get(&GroupId::GPS).unwrap();
+        let out: &Vec<GpsData> = gps_map.get_t(TagId::Data).expect("GPS Vec_GpsData missing");
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|g| g.is_acquired), "GPSF=3 => all locked");
+        assert!((out[0].lat - 31.2304).abs() < 1e-9);
+        assert!((out[0].lon - 121.4737).abs() < 1e-9);
+        assert!((out[0].altitude - 10.0).abs() < 1e-9);
+        assert!((out[0].speed - 5.0).abs() < 1e-9);
+        assert!((out[0].unix_timestamp - 1_700_000_000.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn process_gps_samples_no_gps_group_noop() {
+        let mut samples = vec![make_sample(vec![])];
+        GoPro::process_gps_samples(&mut samples, 0, &crate::InputOptions::default());
+        let map = samples[0].tag_map.as_ref().unwrap();
+        assert!(map.get(&GroupId::GPS).is_none(), "no GPS group should stay absent");
     }
 }
