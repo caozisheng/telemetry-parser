@@ -471,6 +471,19 @@ impl GoPro {
                 (t, gpsf.map(|f| f >= 2).unwrap_or(t > 0.0))
             };
 
+            // GPMF GPS9 column 7 = DOP × 100 (unitless). Divide by
+            // SCAL(7) which defaults to 100 (spec value). GPS5 has no
+            // DOP column → None.
+            let dop = if is_gps9 {
+                let raw = row[7] as f64 / scale(7, 1e2);
+                // Sentinel: raw = 0 means the receiver hadn't finished
+                // a DOP computation; treat as unknown rather than
+                // "perfect".
+                if raw > 0.0 { Some(raw) } else { None }
+            } else {
+                None
+            };
+
             gps.push(GpsData {
                 is_acquired: acquired,
                 unix_timestamp: unix_ts_s,
@@ -479,6 +492,7 @@ impl GoPro {
                 speed,
                 track: 0.0,
                 altitude: alt,
+                dop,
             });
         }
 
@@ -665,6 +679,8 @@ mod tests {
         // Unix = 946_684_800 + 8718 * 86_400 + 44_800 = 1_699_964_800.
         assert!((out[0].unix_timestamp - 1_699_964_800.0).abs() < 1e-3);
         assert!((out[2].unix_timestamp - 1_699_964_800.200).abs() < 1e-3);
+        // DOP col=100 with SCAL(7)=100 → HDOP=1.0
+        assert!((out[0].dop.unwrap() - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -703,6 +719,8 @@ mod tests {
         assert!((out[0].altitude - 10.0).abs() < 1e-9);
         assert!((out[0].speed - 5.0).abs() < 1e-9);
         assert!((out[0].unix_timestamp - 1_700_000_000.0).abs() < 1e-3);
+        // GPS5 has no DOP column → None
+        assert!(out[0].dop.is_none());
     }
 
     #[test]
@@ -759,5 +777,7 @@ mod tests {
         assert!((out[0].lon - 121.4737).abs() < 1e-9);
         assert!((out[0].altitude - 10.0).abs() < 1e-9);
         assert!((out[0].unix_timestamp - 1_699_964_800.0).abs() < 1e-3);
+        // DOP col=100 with SCAL(7)=100 → HDOP=1.0
+        assert!((out[0].dop.unwrap() - 1.0).abs() < 1e-9);
     }
 }

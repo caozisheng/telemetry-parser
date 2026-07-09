@@ -226,7 +226,8 @@ impl super::Insta360 {
                             lon,
                             speed,
                             track,
-                            altitude
+                            altitude,
+                            dop: None,
                         });
                     }
                     Ok(gps)

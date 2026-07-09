@@ -931,6 +931,7 @@ impl GyroflowProtobuf {
                     altitude:       g.altitude_m.unwrap_or(0.0) as f64,
                     speed:          speed_kmh,
                     track:          track_deg,
+                    dop:            None,
                 });
             }
             insert_tag(tag_map,

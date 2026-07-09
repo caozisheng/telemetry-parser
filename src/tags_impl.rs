@@ -357,6 +357,11 @@ pub struct GpsData {
     pub speed: f64, // in km/h
     pub track: f64,
     pub altitude: f64, // in m
+    /// Positional Dilution of Precision (GPMF GPS9 col 7 / 100).
+    /// `None` when the source doesn't emit it (GPS5 legacy, CAMM,
+    /// some Insta360 firmware). Lower = better; typical driving-
+    /// quality fix is < 5, precision surveying < 2.
+    pub dop: Option<f64>,
 }
 
 #[macro_export]
