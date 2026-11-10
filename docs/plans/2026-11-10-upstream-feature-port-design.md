@@ -66,6 +66,57 @@
 
 GPS9 时间采用 2000 年 epoch 加日期/日内时间，GPS5 使用 GPSU。保留无定位行，通过 is_acquired 标识。GPS9 行级 fix 与 frame-level GPSF 的优先级需结合协议/真实样例验证；旧 fork 的 OR 规则作为兼容候选，不作为未经验证的协议结论。GPS5 同包多点时间精度限制需明确，不在此次同步中凭空推断时间。
 
+### Task 4 implementation decisions (2026-11-10)
+
+- GPS9 now maps to GPS/Data alongside GPS5. A focused postprocessor changes only
+  supported GPS Data values, retaining the original description/native ID and
+  companion tags. Wire tests exercise DEVC/STRM, TYPE, single `Vec_Scalar`, multiple
+  `Vec_Vec_Scalar`, and homogeneous i32 rows through the real KLV dispatcher.
+- Canonical `GpsData.speed` remains **km/h**, as documented in `tags_impl.rs` and
+  consumed by the upstream viewer. GPMF's scaled 2D speed is m/s, so 5000/1000
+  becomes 18 km/h, not the old fork's 5. This deliberately fixes the fork's unit
+  mismatch; it is **not drop-in speed compatibility with rimecut-public**.
+- Read-only consumer inspection at `37db9e37dc8359371ad1261766226b2d264c9573`
+  confirms `rust/crates/media-telemetry-parser/src/convert.rs::extract_gps` copies
+  `gps.speed` without conversion. Its raw STRM tests expect 4.732 m/s, and
+  `packages/media-telemetry/src/__tests__/channels.test.ts` explicitly tests m/s
+  pass-through. `plugin-map-view` multiplies `speedMps` by 3.6 for display.
+  **Integration/release blocker:** consumer `extract_gps` must convert canonical
+  km/h to m/s (divide by 3.6) and update its raw STRM expectations before adopting
+  this candidate. No consumer files were modified. Keeping m/s only for GoPro
+  would silently violate the common GpsData contract and was rejected.
+- GPS9 time = Unix epoch 2000 + scaled days * 86400 + scaled seconds-of-day;
+  floating Scalar cells retain fractions rather than truncating through i64.
+  GPS5 uses GPSU seconds for every row in the packet; absent GPSU gives numeric
+  sentinel 0, without inventing intra-packet times or inferring lock from UTC.
+- Only exact fix values 2 and 3 mean acquired. GPS5 requires GPSF; missing GPSF
+  stays unacquired even when UTC exists (safer than the fork's time-based guess).
+  GPS9 preserves the fork's row-fix OR frame-GPSF compatibility policy, bounded
+  to known fix codes. Tests cover row 0/frame 3, row 3/frame 0, neither, missing
+  frame status, and unknown 99. This avoids losing fork-recognized frame-lock
+  rows, but no real HERO11 sample establishes protocol precedence: a frame lock
+  can mark an individually unlocked row acquired. Treat this as a compatibility
+  policy, not proven receiver-level truth.
+- Positive finite SCAL divisors are honored (including scalar common scale).
+  Missing, partial, nonpositive or nonfinite divisors fall back per column to
+  the fork's usual GPS defaults. Thus missing SCAL is best-effort, not proof of
+  a device's units. Unknown Data types remain untouched; short/nonfinite rows
+  are skipped; well-formed unlocked rows are retained. Already-normalized data
+  is unchanged. This is not general malformed-KLV parser hardening.
+- Normal (non-force-grouped) KLV parsing temporarily retains GPS dependencies,
+  canonicalizes GPS Data, then applies the caller's exact whitelist/blacklist.
+  Data-only selection and dependency blacklisting must not change canonical
+  coordinates, speed, UTC, or fix (including GPS9 frame-fix compatibility).
+  Force-grouped detection/clip metadata intentionally remains raw and filtered;
+  it is not promoted into a second canonical GPS stream.
+- The standalone gopro-gps CLI consumes canonical GPS5/GPS9 points (all packet
+  rows), converting km/h back to m/s for CSV/GPX. Canonical data has no 3D speed:
+  the existing CSV column is left empty, not filled with 2D speed or zero. KML
+  exports coordinates unchanged. The old raw-i32-only CLI path is replaced,
+  since normal GoPro parsing now always canonicalizes supported GPS5/9 rows.
+- DOP is intentionally not added or extracted here; Task 5 owns that change.
+  No real-media/consumer build compatibility claim is made by synthetic tests.
+
 ## Feature 3：DOP 字段与序列化
 
 在 `src/tags_impl.rs::GpsData` 保留 `pub dop: Option<f64>`。按用户最终选择，字段名为 dop，None 序列化为 JSON null，不使用 skip_serializing_if。

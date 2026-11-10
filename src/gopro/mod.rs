@@ -5,6 +5,7 @@ pub mod klv;
 
 mod eac;
 mod fusion;
+mod gps;
 mod lens_profile;
 mod udta;
 
@@ -265,6 +266,19 @@ impl GoPro {
     }
 
     pub fn parse_metadata(data: &[u8], group_id: GroupId, force_group: bool, options: &crate::InputOptions) -> Result<GroupedTagMap> {
+        let mut map = Self::parse_metadata_inner(data, group_id, force_group, options)?;
+        if !force_group {
+            // Retain GPS dependencies until canonicalization, then honor the
+            // caller's exact output selection. Force-grouped metadata stays raw.
+            gps::normalize(&mut map);
+            if let Some(gps) = map.remove(&GroupId::GPS) {
+                for (_, tag) in gps { util::insert_tag(&mut map, tag, options); }
+            }
+        }
+        Ok(map)
+    }
+
+    fn parse_metadata_inner(data: &[u8], group_id: GroupId, force_group: bool, options: &crate::InputOptions) -> Result<GroupedTagMap> {
         let mut slice = Cursor::new(data);
         let datalen = data.len() as u64;
         let mut map = GroupedTagMap::new();
@@ -287,7 +301,7 @@ impl GoPro {
 
                 if klv.data_type == 0 { // Container
                     let container_group = if force_group { group_id.clone() } else { KLV::group_from_key(GoPro::get_last_klv(tag_data)?) };
-                    for (g, v) in GoPro::parse_metadata(tag_data, container_group, force_group, options)? {
+                    for (g, v) in GoPro::parse_metadata_inner(tag_data, container_group, force_group, options)? {
                         let group_map = map.entry(g).or_insert_with(TagMap::new);
                         group_map.extend(v);
                     }
@@ -304,13 +318,15 @@ impl GoPro {
                     klv.custom_type = last_type.clone();
                 }
 
+                let gps_options = crate::InputOptions::default();
+                let insert_options = if !force_group && group_id == GroupId::GPS { &gps_options } else { options };
                 util::insert_tag(&mut map, TagDescription {
                     group:       group_id.clone(),
                     id:          klv.tag_id(),
                     description: klv.key_as_string(),
                     value:       klv.parse_data(full_tag_data),
                     native_id:   Some((&klv.key[..]).read_u32::<BigEndian>()?)
-                }, options);
+                }, insert_options);
             } else {
                 break;
             }
@@ -369,6 +385,9 @@ impl GoPro {
     }
 
     fn process_samples(&mut self, samples: &mut Vec<SampleInfo>, fps: Option<f64>, options: &crate::InputOptions) {
+        for sample in samples.iter_mut() {
+            if let Some(map) = sample.tag_map.as_mut() { gps::normalize(map); }
+        }
         // Normalize quaternions
         let mut prev_increment = 0;
         let mut start_timestamp_us = None;
