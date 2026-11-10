@@ -60,7 +60,15 @@ pub(super) fn normalize(map: &mut GroupedTagMap) {
     for row in rows {
         if row.len() < if gps9 { 9 } else { 5 } { continue; }
         // Do not coerce malformed heterogeneous cells into real coordinates.
-        if row.iter().any(|v| !v.is_finite()) { continue; }
+        // An invalid optional DOP must not discard an otherwise usable fix.
+        if row.iter().enumerate().any(|(col, v)| !(gps9 && col == 7) && !v.is_finite()) { continue; }
+        // Preserve the fork's absent-SCAL divisor of 100, but reject explicit invalid divisors.
+        let dop = if gps9 {
+            let divisor = if divisors.len() == 1 { divisors.first() } else { divisors.get(7) };
+            divisor.copied().or_else(|| (!gps.contains_key(&TagId::Scale)).then_some(100.0))
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| row[7] / v).filter(|v| v.is_finite() && *v > 0.0)
+        } else { None };
         let timestamp = if gps9 {
             946_684_800.0 + row[5] / scale(5) * 86_400.0 + row[6] / scale(6)
         } else {
@@ -76,6 +84,7 @@ pub(super) fn normalize(map: &mut GroupedTagMap) {
             altitude: row[2] / scale(2),
             speed: row[3] / scale(3) * 3.6, // GPMF m/s -> GpsData km/h
             track: 0.0,
+            dop,
         });
     }
     // Preserve provenance (description/native_id) and all companion tags.
@@ -195,6 +204,7 @@ mod tests {
                 assert!((out[0].lat - 37.7749).abs() < 1e-8);
                 assert!((out[0].lon + 122.4194).abs() < 1e-8);
                 assert_eq!(out[0].altitude, 10.5);
+                assert_eq!(out[0].dop, Some(1.0));
                 assert_eq!(out[0].speed, 18.0); // 5 m/s -> canonical km/h
                 assert_eq!(out[0].unix_timestamp, 1699964800.0);
                 assert!(out[0].is_acquired);
@@ -214,6 +224,7 @@ mod tests {
                 let out = points(&samples);
                 assert_eq!(out.len(), 2);
                 assert_eq!(out[0].is_acquired, acquired);
+                assert_eq!(out[0].dop, None);
                 assert_eq!(out[0].unix_timestamp, if utc { 1699963200.0 } else { 0.0 });
                 assert_eq!(out[1].unix_timestamp, out[0].unix_timestamp); // no invented subpacket time
                 assert_eq!(out[0].speed, 18.0);
@@ -238,6 +249,7 @@ mod tests {
         assert_eq!((p.lat, p.lon, p.altitude, p.speed), (10.0, -20.0, 3.0, 18.0));
         assert_eq!(p.unix_timestamp, 946684800.0 + 2.0 * 86400.0 + 10.0);
         assert!(p.is_acquired);
+        assert_eq!(p.dop, Some(2.0));
     }
     #[test]
     fn gps_custom_floats_and_invalid_scale_fallback() {
@@ -256,6 +268,41 @@ mod tests {
         assert_eq!(p.speed, 0.0);
         assert!(!p.is_acquired);
         assert!((p.lat - 37.7749).abs() < 1e-8);
+    }
+    #[test]
+    fn gps9_dop_requires_positive_finite_value_and_scale() {
+        for raw in [100.0f64, 0.0, -100.0, f64::NAN, f64::INFINITY] {
+            for divisor in [Some(100.0f64), Some(0.0), Some(-1.0), Some(f64::NAN), Some(f64::INFINITY), Some(f64::MIN_POSITIVE), None] {
+                for common_scale in [false, true] {
+                    let mut body = Vec::new();
+                    if let Some(divisor) = divisor {
+                        let scales = if common_scale { vec![divisor] }
+                            else { vec![1e7, 1e7, 1e3, 1e3, 1e3, 1.0, 1e3, divisor, 1.0] };
+                        body.extend(klv(b"SCAL", b'd', 8, scales.len() as u16,
+                            &scales.iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<_>>()));
+                    }
+                    body.extend(klv(b"TYPE", b'c', 1, 9, b"ddddddddd"));
+                    let row = [377749000.0f64, -1224194000.0, 10500.0, 5000.0, 5200.0, 8718.0, 44800000.0, raw, 3.0];
+                    body.extend(klv(b"GPS9", b'?', 72, 1,
+                        &row.iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<_>>()));
+                    let mut samples = parse(&klv(b"STRM", 0, 1, body.len() as u16, &body));
+                    normalize(&mut samples);
+                    let out = points(&samples);
+                    assert_eq!(out.len(), 1, "invalid DOP must retain the point");
+                    let expected = divisor.or(Some(100.0)).filter(|v| v.is_finite() && *v > 0.0)
+                        .map(|v| raw / v).filter(|v| v.is_finite() && *v > 0.0);
+                    assert_eq!(out[0].dop, expected);
+                }
+            }
+        }
+    }
+    #[test]
+    fn gps9_empty_explicit_scale_does_not_use_absent_scale_default() {
+        let mut body = ints(b"SCAL", 4, 0, &[]);
+        body.extend(ints(b"GPS9", 36, 1, &[377749000, -1224194000, 10500, 5000, 5200, 8718, 44800000, 100, 3]));
+        let mut samples = parse(&klv(b"STRM", 0, 1, body.len() as u16, &body));
+        normalize(&mut samples);
+        assert_eq!(points(&samples)[0].dop, None);
     }
     #[test]
     fn gps_raw_parse_runs_normalization() {

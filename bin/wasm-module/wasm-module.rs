@@ -333,6 +333,23 @@ fn leaves(v: &serde_json::Value, path: &mut String, out: &mut Vec<(String, f64)>
     }
 }
 
+/// Numeric projection of one typed reading, shared by tags, series and flat output.
+fn numeric_reading(value: &TagValue, json: &serde_json::Value, out: &mut Vec<(String, f64)>) {
+    if let (TagValue::Vec_GpsData(_), serde_json::Value::Object(fields)) = (value, json) {
+        // Only canonical GPS has this optional numeric field. Keep its slot even
+        // when absent; do not change null semantics for arbitrary JSON metadata.
+        for (name, field) in fields {
+            if name == "dop" && field.is_null() {
+                out.push((name.clone(), f64::NAN));
+            } else {
+                leaves(field, &mut name.clone(), out, 1);
+            }
+        }
+    } else {
+        leaves(json, &mut String::new(), out, 0);
+    }
+}
+
 /// The readings of a value: one for a single value, each item of a list of readings
 fn readings<'a>(v: &TagValue, json: &'a serde_json::Value) -> (bool, Vec<&'a serde_json::Value>) {
     match json {
@@ -515,7 +532,7 @@ impl Parser {
                 let (is_list, items) = readings(&e.first.value, &json);
                 if is_list { len = JsValue::from_f64(items.len() as f64); }
                 if let Some(first) = items.first() {
-                    leaves(first, &mut String::new(), &mut channels, 0);
+                    numeric_reading(&e.first.value, first, &mut channels);
                 }
             }
             let o = Object::new();
@@ -631,7 +648,7 @@ impl Parser {
             let n = items.len();
             for (i, item) in items.into_iter().enumerate() {
                 buf.clear();
-                leaves(item, &mut String::new(), &mut buf, 0);
+                numeric_reading(&desc.value, item, &mut buf);
                 if buf.is_empty() { continue; }
                 let channels_before = channels.len();
                 let mut row = Vec::with_capacity(buf.len());
@@ -849,7 +866,7 @@ pub fn telemetry_flat(data: &[u8], filename: &str, filter: &str) -> Result<Float
                 let (_, items) = readings(&desc.value, &json);
                 for item in items {
                     buf.clear();
-                    leaves(item, &mut String::new(), &mut buf, 0);
+                    numeric_reading(&desc.value, item, &mut buf);
                     out.extend(buf.iter().map(|(_, v)| *v));
                 }
             }
@@ -864,4 +881,45 @@ pub fn telemetry_flat(data: &[u8], filename: &str, filter: &str) -> Result<Float
     }
     out[0] = frames as f64;
     Ok(Float64Array::from(&out[..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gps_numeric_schema_is_stable_in_both_dop_orders() {
+        for dops in [[None, Some(1.25)], [Some(1.25), None], [None, None]] {
+            let points: Vec<GpsData> = dops.into_iter().map(|dop| GpsData { dop, ..Default::default() }).collect();
+            let value = TagValue::Vec_GpsData(ValueType::new_parsed(|_| String::new(), points, Vec::new()));
+            let json = serde_json::to_value(&value).unwrap();
+            let (_, items) = readings(&value, &json);
+            let mut flat = Vec::new();
+            let mut channels = Vec::new();
+            for (i, item) in items.into_iter().enumerate() {
+                assert_eq!(item["dop"], serde_json::to_value(dops[i]).unwrap());
+                let mut row = Vec::new();
+                numeric_reading(&value, item, &mut row);
+                let names: Vec<_> = row.iter().map(|x| x.0.clone()).collect();
+                if i == 0 { channels = names; } else { assert_eq!(channels, names); }
+                assert_eq!(row.len(), 8);
+                let dop = row.iter().find(|x| x.0 == "dop").unwrap().1;
+                match dops[i] { Some(v) => assert_eq!(dop, v), None => assert!(dop.is_nan()) }
+                flat.extend(row.into_iter().map(|x| x.1));
+            }
+            assert_eq!(flat.len(), 16);
+            assert!(channels.iter().any(|x| x == "dop"));
+        }
+    }
+
+    #[test]
+    fn unrelated_nulls_are_not_numeric_channels() {
+        let value = TagValue::Json(ValueType::new_parsed(|_| String::new(), serde_json::json!({"dop": null, "other": null}), Vec::new()));
+        // Generic leaves retain their old semantics, even for a field named dop.
+        let mut out = Vec::new();
+        leaves(&serde_json::json!({"dop": null, "other": null}), &mut String::new(), &mut out, 0);
+        assert!(out.is_empty());
+        numeric_reading(&value, &serde_json::to_value(&value).unwrap(), &mut out);
+        assert!(out.is_empty());
+    }
 }

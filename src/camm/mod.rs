@@ -125,7 +125,8 @@ impl Camm {
                                 lon: longitude,
                                 speed: 0.0,
                                 track: 0.0,
-                                altitude
+                                altitude,
+                                dop: None,
                             });
                         },
                         6 => { // gps
@@ -148,7 +149,8 @@ impl Camm {
                                 lon: longitude,
                                 speed: 0.0, // TODO
                                 track: 0.0, // TODO
-                                altitude
+                                altitude,
+                                dop: None,
                             });
                         },
                         7 => { // magnetic_field

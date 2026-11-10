@@ -357,6 +357,7 @@ pub struct GpsData {
     pub speed: f64, // in km/h
     pub track: f64,
     pub altitude: f64, // in m
+    pub dop: Option<f64>, // dimensionless dilution of precision; not necessarily HDOP
 }
 
 #[macro_export]
@@ -377,3 +378,21 @@ macro_rules! tag {
 
 pub type TagMap = BTreeMap<TagId, TagDescription>;
 pub type GroupedTagMap = BTreeMap<GroupId, TagMap>;
+
+#[cfg(test)]
+mod gps_data_tests {
+    use super::GpsData;
+
+    #[test]
+    fn gps_data_some_dop_serializes_as_number() {
+        let gps = GpsData { dop: Some(1.0), ..Default::default() };
+        let json = serde_json::to_value(gps).unwrap();
+        assert_eq!(json.get("dop"), Some(&serde_json::json!(1.0)));
+    }
+
+    #[test]
+    fn gps_data_default_serializes_dop_as_null() {
+        let json = serde_json::to_value(GpsData::default()).unwrap();
+        assert_eq!(json.get("dop"), Some(&serde_json::Value::Null));
+    }
+}

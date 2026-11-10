@@ -144,3 +144,48 @@ GPS9 从列 7 按对应 SCAL 解码；零值/未知值策略由用例固定。GP
 运行库测试、可选 sony-xml 测试、GoPro wire-format/规范化/DOP 回归、DJI 消费契约、Python 和 WASM 的独立 manifest 检查/构建、真实样例与 rimecut-public 集成检查。根目录 cargo test --all 不会自动覆盖所有独立 bin crate。FFmpeg native 依赖工具、缺失平台工具链或真实样例的检查分别记录为未验证，不以绿色根测试替代。
 
 本设计不承诺工具链、消费方和媒体样例尚未取得时即可完成发布。
+
+### Task 5 implementation decisions and verification (2026-11-10)
+
+- Canonical `GpsData` now serializes `dop` unconditionally: missing values are
+  JSON null, present values are numbers. The field is dimensionless DOP, not a
+  claim of HDOP/PDOP. Adding a public field breaks external exhaustive Rust
+  struct literals; `Option`/`Default` do not remove that source compatibility cost.
+- GPS9 column 7 honors a positive finite SCAL divisor (column 7 or the
+  common scalar). Absent SCAL retains the old fork's compatibility default of
+  100; an explicitly invalid divisor or a partial SCAL missing column 7 yields
+  None. The quotient must be positive and finite. An invalid optional DOP retains the point with None; other
+  nonfinite row cells retain Task 4's row-rejection behavior. GPS5, CAMM,
+  Insta360 and Gyroflow set None. Tests cover integer/heterogeneous single/multi
+  rows, custom scales, zero/negative/nonfinite values and divisors, overflow,
+  and serialization. All canonical struct literals were checked with rg;
+  `gyroflow_proto::GpsData` is a separate generated protobuf type, unchanged.
+- Read-only rimecut-public inspection at
+  `37db9e37dc8359371ad1261766226b2d264c9573`: `extract_gps` copies `gps.dop`
+  directly into `GpsPoint`. Rust/TS type comments and the map picker call it
+  positional DOP/PDOP, not HDOP. No conversion or protocol proof of that
+  narrower label was found. GpsPoint omits absent DOP in its own JSON via
+  skip_serializing_if; that consumer boundary differs intentionally from this
+  crate's null contract. No consumer files changed or consumer build claimed.
+  The previously documented km/h-to-m/s integration blocker still applies.
+- WASM numeric projections now share a typed `Vec_GpsData` reading helper:
+  `tags()` includes dop even when the first reading is missing it; `series`
+  and `telemetry_flat` retain that slot as NaN. Canonical GPS readings have
+  eight numeric channels (including the acquired boolean); mixed None/Some
+  DOP cannot change widths or channel order. Only canonical GPS's optional
+  dop receives this handling; arbitrary JSON nulls (even named dop) still
+  produce no numeric channel. Ordinary telemetry JSON retains dop:null.
+  Host-manifest pure-function tests cover missing->present, present->missing,
+  all-missing, first-reading channel metadata, flat widths and null isolation.
+  The new projection regression failed before the helper implementation
+  (7 versus 8 channels), then passed. This does not claim browser JS runtime
+  validation or resolve the consumer speed-unit release blocker.
+- rustc 1.93.1: the default-null regression first failed because the field was
+  absent. After implementation `cargo test --locked` passed (56 passed,
+  1 ignored), and `cargo test --locked --features sony-xml` passed (57 passed,
+  1 ignored). Python and wasm32-unknown-unknown manifests passed locked checks.
+  gopro-gps and gyro2bb passed offline checks with temporary refreshed lockfiles
+  restored byte-for-byte afterwards; their locked checks require lock refresh.
+  gyroflow_proto_convert/inject locked checks likewise require lock refresh;
+  offline retries stopped on uncached simplelog 0.12.2 / bindgen 0.73.2.
+  No release/consumer/real-media runtime validation is claimed.

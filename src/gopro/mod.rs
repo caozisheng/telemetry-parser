@@ -292,7 +292,8 @@ impl GoPro {
                 let pos = slice.position() as usize;
 
                 let len = klv.data_len();
-                if len == 0 { continue; }
+                // Keep an explicit empty SCAL descriptor so GPS DOP can distinguish it from absent SCAL.
+                if len == 0 && !(!force_group && group_id == GroupId::GPS && &klv.key == b"SCAL") { continue; }
 
                 let full_tag_data = &data[start_pos..(pos + len)];
                 let tag_data      = &data[pos      ..(pos + len)];
