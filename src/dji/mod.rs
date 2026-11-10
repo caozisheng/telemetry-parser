@@ -17,8 +17,24 @@ use prost::Message;
 use rig::Schema;
 
 mod csv;
+#[cfg(test)]
+mod tests;
 pub(crate) mod timing;
 use timing::HeldQuaternions;
+
+// Compatibility for consumers reading pano calibration from Default/Metadata.
+// Serialize the stream generically: Wm169 has no pano_dewarp_params field.
+fn clip_metadata_json<C: serde::Serialize, S: serde::Serialize>(clip: &C, stream: Option<&S>) -> serde_json::Result<serde_json::Value> {
+    let mut metadata = serde_json::to_value(clip)?;
+    if let Some(stream) = stream
+        && let Ok(mut stream) = serde_json::to_value(stream)
+        && let Some(pano) = stream.get_mut("pano_dewarp_params").filter(|p| !p.is_null())
+        && let Some(metadata) = metadata.as_object_mut()
+    {
+        metadata.insert("pano_dewarp_params".into(), pano.take());
+    }
+    Ok(metadata)
+}
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct HeaderProbe {
@@ -194,7 +210,7 @@ impl Dji {
                         sample_rate = v;
                     }
 
-                    let v = serde_json::to_value(&clip).map_err(|_| Error::new(ErrorKind::Other, "Serialize error"));
+                    let v = clip_metadata_json(clip, $parsed.stream_meta.as_ref()).map_err(|_| Error::new(ErrorKind::Other, "Serialize error"));
                     if let Ok(vv) = v {
                         log::debug!("Metadata: {:?}", &vv);
                         insert_tag(&mut tag_map, tag!(parsed GroupId::Default, TagId::Metadata, "Metadata", Json, |v| serde_json::to_string(v).unwrap(), vv, vec![]), &options);
