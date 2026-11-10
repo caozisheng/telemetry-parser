@@ -1061,18 +1061,18 @@ impl LensMetadata {
         for (j, run) in runs.iter().enumerate().skip(1) {
             let Some(end_point) = end else { break };
             let agrees = run.periods_to(level, tolerance);
-            let k = match by_timecode(run, level, end_point.ticks) {
-                Some(k) => k,
+            let k = match (by_timecode(run, level, end_point.ticks), agrees) {
+                (Some(k), _) => k,
                 // A single poll that the timecode puts further back is a record out of place, a stale or moved poll: its own
                 // timecode places it, out of order
-                None if run.polls.len() == 1 && let Some(k) = agrees => {
+                (None, Some(k)) if run.polls.len() == 1 => {
                     periods[j] = Some((k, false));
                     continue;
                 },
                 // A timecode that disagrees with the runs before was reset, unless a later run agrees with them again before one
                 // agrees with this run, and so was one that runs on further back than the lens clock reads. The run then follows
                 // the latest poll through the polls between, as the lens clock places those alone
-                None if agrees.is_some() || runs[j + 1..].iter()
+                (None, _) if agrees.is_some() || runs[j + 1..].iter()
                     .find_map(|later| if later.periods_to(run.offset, tolerance).is_some() { Some(true) } else { by_timecode(later, level, end_point.ticks).map(|_| false) })
                     .unwrap_or(true) => {
                     let i = run.polls[0];
@@ -1080,7 +1080,7 @@ impl LensMetadata {
                         .fold(end_point, |latest, raw| ClockPoint { raw, ticks: latest.following(raw) });
                     (followed.following(self.polls[i].kdi.unwrap_or_default()) - lens[i].unwrap_or_default()) / TIMESTAMP_MODULUS
                 },
-                None => continue,
+                (None, _) => continue,
             };
             periods[j] = Some((k, true));
             level = run.offset + (k * TIMESTAMP_MODULUS) as f64;
