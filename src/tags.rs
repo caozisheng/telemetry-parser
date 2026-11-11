@@ -20,6 +20,7 @@ declare_groups! {
     CameraOrientation,
     ImageOrientation,
     Cooke,
+    LensBreathing,
 }
 
 declare_ids! {
@@ -82,12 +83,14 @@ declare_ids! {
     PixelHeight,
     RollingShutterCorrection,
     SerialNumber,
+    TiltRoll,
 
     Name,
     DisplayName,
     Enabled,
     Data,
     Data2,
+    Rig,
     Unit,
     Matrix,
     Temperature,
@@ -116,6 +119,8 @@ declare_types! {
     f64x3:  (f64, f64, f64),
 
     GpsData: GpsData,
+
+    CameraRig: crate::rig::CameraRig,
 
     Vec_Quaternioni16: Vec<Quaternion<i16>>,
     Vec_TimeScalar_f64: Vec<TimeScalar<f64>>,

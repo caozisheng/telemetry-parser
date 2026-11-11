@@ -35,12 +35,12 @@ pub fn parse(data: &[u8]) -> Metadata {
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Empty(ref e)) => {
-                if e.name().as_ref() == b"Duration" || e.name().as_ref() == b"Device" {
+                if e.name().as_ref() == "Duration" || e.name().as_ref() == "Device" {
                     for ox in e.attributes() {
                         if let Ok(x) = ox {
-                            if x.key.as_ref() == b"value"        { frame_count = String::from_utf8_lossy(&x.value).parse::<usize>().unwrap(); }
-                            if x.key.as_ref() == b"modelName"    { model = String::from_utf8_lossy(&x.value).into(); }
-                            if x.key.as_ref() == b"manufacturer" { manufacturer = String::from_utf8_lossy(&x.value).into(); }
+                            if x.key.as_ref() == "value"        { frame_count = x.value.parse::<usize>().unwrap(); }
+                            if x.key.as_ref() == "modelName"    { model = x.value.to_string(); }
+                            if x.key.as_ref() == "manufacturer" { manufacturer = x.value.to_string(); }
                         }
                     }
                 }
@@ -52,4 +52,17 @@ pub fn parse(data: &[u8]) -> Metadata {
         buf.clear();
     }
     Metadata { manufacturer, model, frame_count }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_device_and_duration_attributes() {
+        let metadata = parse(br#"<NonRealTimeMeta><Duration value="120"/><Device manufacturer="Sony" modelName="ILCE-7SM3"/></NonRealTimeMeta>"#);
+        assert_eq!(metadata.frame_count, 120);
+        assert_eq!(metadata.manufacturer, "Sony");
+        assert_eq!(metadata.model, "ILCE-7SM3");
+    }
 }

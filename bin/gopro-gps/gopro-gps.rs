@@ -27,12 +27,33 @@ struct Opts {
     file: String,
 }
 
-struct GPS5 {
-    latitude : f32,
-    longitude : f32,
-    altitude: f32,
-    speed_2d: f32,
-    speed_3d: f32,
+// Canonical GPS has 2D speed only. Keep the CSV 3D column empty rather
+// than inventing a value that the canonical representation cannot supply.
+fn export_point(point: &GpsData, opts: &Opts) -> Option<String> {
+    let utc = Utc.timestamp_millis_opt((point.unix_timestamp * 1000.0).round() as i64).single()?;
+    let time = utc.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let speed_mps = point.speed / 3.6;
+    if opts.csv {
+        Some(format!("{},{},{},{},{},", time, point.lat, point.lon, point.altitude, speed_mps))
+    } else if opts.kml {
+        Some(format!("{},{},{}", point.lon, point.lat, point.altitude))
+    } else if opts.gpx {
+        Some(format!("<trkpt lat=\"{}\" lon=\"{}\">
+  <ele>{}</ele>
+  <time>{}</time>
+  <speed>{}</speed>
+</trkpt>",
+            point.lat, point.lon, point.altitude, time, speed_mps))
+    } else {
+        None
+    }
+}
+
+fn export_gps(map: &TagMap, opts: &Opts) -> Vec<String> {
+    match map.get(&TagId::Data).map(|tag| &tag.value) {
+        Some(TagValue::Vec_GpsData(points)) => points.get().iter().filter_map(|p| export_point(p, opts)).collect(),
+        _ => Vec::new(),
+    }
 }
 
 const KML_HEAD: &'static str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -56,7 +77,7 @@ fn main() {
     let opts: Opts = argh::from_env();
 
     let mut stream = std::fs::File::open(&opts.file).unwrap();
-    let filesize = stream.metadata().unwrap().len() as usize;
+    let filesize = stream.metadata().unwrap().len();
 
     match opts {
         Opts { csv: true, .. } => {
@@ -95,84 +116,8 @@ fn main() {
         }
         let grouped_tag_map = info.tag_map.as_ref().unwrap();
 
-        for (group, map) in grouped_tag_map {
-            let mut utc_time: Option<u64> = None;
-            let mut gps5: Option<GPS5> = None;
-
-            if group == &GroupId::GPS {
-                for (_tagid, taginfo) in map {
-                    match &taginfo.description as &str {
-                        // TODO timing from SHUT?
-
-                        "GPSU" => {
-                            if let TagValue::u64(time) = &taginfo.value {
-                                // println!("UTC Time: {}", time.get());
-                                utc_time = Some(*time.get());
-                            } else {
-                                eprintln!("Unexpected tag value type for GPSU");
-                            }
-                        }
-                        // GPS Name STNM : GPS (Lat., Long., Alt., 2D speed, 3D speed)
-                        // GPS Unit UNIT : ["deg", "deg", "m", "m/s", "m/s"]
-                        // GPS Scale SCAL : [10000000, 10000000, 1000, 1000, 100]
-
-                        "GPS5" => {
-                            if let TagValue::Vec_Vec_i32(gpsdata) = &taginfo.value {
-                                let data = gpsdata.get();
-                                //for entry in data {
-                                //    println!("GPS5: {:?}", entry);
-                                //}
-                                gps5 = Some(GPS5 {
-                                    latitude:  data[0][0] as f32 / 10000000.0 ,
-                                    longitude: data[0][1] as f32 / 10000000.0,
-                                    altitude:  data[0][2] as f32 / 1000.0,
-                                    speed_2d:  data[0][3] as f32 / 1000.0,
-                                    speed_3d:  data[0][4] as f32 / 100.0,
-                                });
-                            } else {
-                                eprintln!("Unexpected tag value type for GPS5");
-                            }
-                        }
-                        // TagId::UTC => utc_time = Some(taginfo.value.to_string()),
-                        // TagId::Latitude => latitude = Some(taginfo.value.to_string()),
-                        // TagId::Longitude => longitude = Some(taginfo.value.to_string()),
-                        _ => {}
-                    }
-
-                }
-                if utc_time.is_some() && gps5.is_some() {
-                    let gps5 = gps5.unwrap();
-                    // println!("UTC Time: {} Latitude: {} Longitude: {} Altitude: {} 2D Speed: {} 3D Speed: {}", utc_time.unwrap(), gps5.latitude, gps5.longitude, gps5.altitude, gps5.speed_2d, gps5.speed_3d);
-                    match opts {
-                        Opts { csv: true, .. } => {
-                            let utc = Utc.timestamp_millis_opt(utc_time.unwrap() as i64).unwrap();
-                            println!("{},{},{},{},{},{}", utc.to_rfc3339_opts(SecondsFormat::Millis, true), gps5.latitude, gps5.longitude, gps5.altitude, gps5.speed_2d, gps5.speed_3d);
-                        }
-                        Opts { kml: true, .. } => {
-                            println!("{},{},{}", gps5.longitude, gps5.latitude, gps5.altitude);
-                        }
-                        Opts { gpx: true, .. } => {
-                            let utc = Utc.timestamp_millis_opt(utc_time.unwrap() as i64).unwrap();
-                            println!("<trkpt lat=\"{}\" lon=\"{}\">", gps5.latitude, gps5.longitude);
-                            println!("  <ele>{}</ele>", gps5.altitude);
-                            println!("  <time>{}<time>", utc.to_rfc3339_opts(SecondsFormat::Millis, true));
-                            println!("  <speed>{}</speed>", gps5.speed_2d);
-                            println!("</trkpt>");
-                        }
-                        _ => { }
-                    }
-                }
-
-                // for (tagid, taginfo) in map {
-                //     println!(
-                //         "{: <25} {: <25} {: <50}: {}",
-                //         format!("{}", group),
-                //         format!("{}", tagid),
-                //         taginfo.description,
-                //         &taginfo.value.to_string()
-                //     );
-                // }
-            }
+        if let Some(map) = grouped_tag_map.get(&GroupId::GPS) {
+            for line in export_gps(map, &opts) { println!("{}", line); }
         }
     }
 
@@ -181,5 +126,48 @@ fn main() {
         Opts { kml: true, .. } => { println!("{}", KML_END); }
         Opts { gpx: true, .. } => { println!("{}", GPX_END); }
         _ => { }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn klv(key: &[u8; 4], ty: u8, size: u8, repeat: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = key.to_vec();
+        out.extend([ty, size]);
+        out.extend(repeat.to_be_bytes());
+        out.extend(data);
+        while out.len() % 4 != 0 { out.push(0); }
+        out
+    }
+
+    #[test]
+    fn exports_parsed_gps5_and_gps9_canonical_points() {
+        for gps9 in [false, true] {
+            let mut body = klv(b"GPSU", b'U', 16, 1, b"231114120000.000");
+            let mut rows = Vec::new();
+            for _ in 0..2 {
+                let row: &[i32] = if gps9 { &[10000000, -20000000, 3000, 5000, 6000, 8718, 43200000, 100, 3] }
+                                 else { &[10000000, -20000000, 3000, 5000, 6000] };
+                rows.extend(row.iter().flat_map(|v| v.to_be_bytes()));
+            }
+            body.extend(klv(if gps9 { b"GPS9" } else { b"GPS5" }, b'l', if gps9 { 36 } else { 20 }, 2, &rows));
+            let stream = klv(b"STRM", 0, 1, body.len() as u16, &body);
+            let data = klv(b"DEVC", 0, 1, stream.len() as u16, &stream);
+            let input = Input::from_stream(&mut std::io::Cursor::new(&data), data.len() as u64,
+                "test.gpmf", |_| (), Arc::new(AtomicBool::new(false))).unwrap();
+            let opts = Opts { csv: true, kml: false, gpx: false, file: String::new() };
+            let maps: Vec<_> = input.samples.as_ref().unwrap().iter().filter_map(|s| s.tag_map.as_ref()?.get(&GroupId::GPS)).collect();
+            assert_eq!(maps.len(), 1);
+            let lines = export_gps(maps[0], &opts);
+            assert_eq!(lines, vec!["2023-11-14T12:00:00.000Z,1,-2,3,5,"; 2]);
+            let gpx = export_gps(maps[0], &Opts { csv: false, gpx: true, ..opts });
+            assert_eq!(gpx.len(), 2);
+            assert!(gpx[0].contains("<speed>5</speed>"));
+            assert!(gpx[0].contains("<time>2023-11-14T12:00:00.000Z</time>"));
+            let kml = export_gps(maps[0], &Opts { csv: false, gpx: false, kml: true, file: String::new() });
+            assert_eq!(kml, vec!["-2,1,3"; 2]);
+        }
     }
 }

@@ -121,10 +121,86 @@ pub struct ExtraMetadata {
     #[prost(enumeration="extra_metadata::VideoPtsType", tag="64")] pub pts_type: i32,
     #[prost(message, optional, tag="65")] pub gyro_cfg_info: Option<extra_metadata::GyroConfigInfo>,
 
+    /// What the camera recorded its lenses as wearing: lens guards, an ND
+    /// filter, a dive case — or nothing (`Common`, also an absent field).
+    #[serde(serialize_with="OffsetState_serializer")]
+    #[prost(enumeration="OffsetState", tag="68")] pub offset_states: i32,
+
+    #[serde(serialize_with="PanoRecordType_serializer")]
+    #[prost(enumeration="extra_metadata::PanoRecordType", tag="79")] pub pano_record_type: i32,
+    /// Which of a two-track file's tracks holds which lens. The one statement
+    /// the vendor binds a track to a lens by; `stream_type` says nothing to it.
+    #[serde(serialize_with="PanoRecordMultiTrackOrder_serializer")]
+    #[prost(enumeration="extra_metadata::PanoRecordMultiTrackOrder", tag="80")] pub pano_record_multi_track_order: i32,
+
+    /// Whether the cooling shell (the Thermo Grip Cover) was on: set by the
+    /// user, or left to the camera's own detection.
+    #[serde(serialize_with="CoolingShellSelectedState_serializer")]
+    #[prost(enumeration="extra_metadata::CoolingShellSelectedState", tag="105")] pub cooling_shell_selected_state: i32,
+    /// What the camera's own detection of the cooling shell found.
+    #[serde(serialize_with="CoolingShellAlgoDetectedState_serializer")]
+    #[prost(enumeration="extra_metadata::CoolingShellAlgoDetectedState", tag="106")] pub cooling_shell_algo_state: i32,
+
+    #[prost(string, tag="111")] pub offset_v6: String,
+    #[prost(string, tag="112")] pub original_offset_v6: String,
+
+    /// How the camera's pictures are spread over files and tracks — including
+    /// whether the two lenses' tracks are in lens order or reversed.
+    #[serde(serialize_with="StreamType_serializer")]
+    #[prost(enumeration="extra_metadata::StreamType", tag="131")] pub stream_type: i32,
+
+    /// Which offset string the camera wrote last. **Advisory** — the enum
+    /// value is not the version number (`OFFSET_V6 = 4`), and the vendor's own
+    /// player ignores it in favour of a fixed v6 > v3 > v2 > v1 preference.
+    #[serde(serialize_with="OffsetVersion_serializer")]
+    #[prost(enumeration="extra_metadata::OffsetVersion", tag="136")] pub capture_offset_version: i32,
+
+}
+
+/// What the camera recorded its lenses as wearing — `insta360.messages.OffsetState`,
+/// under the vendor's own names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, ::serde::Serialize, ::serde::Deserialize)]
+#[repr(i32)]
+pub enum OffsetState {
+    Common         = 0,
+    SphereProtect  = 1,
+    DivingWater    = 2,
+    DivingWater23  = 3,
+    ProtectA       = 4,
+    ProtectS       = 5,
+    ProtectAuto    = 6,
+    FilterNd16     = 7,
+    FilterNd32     = 8,
+    FilterNd64     = 9,
+    DivingWaterPro = 10,
+    DivingAirPro   = 11,
+    FilterNd128    = 12,
+    FilterJoystick = 13,
+    G01Protect     = 14,
 }
 
 /// Nested message and enum types in `ExtraMetadata`.
 pub mod extra_metadata {
+    /// Whether the cooling shell was on (`CoolingShellSelectedState`): stated,
+    /// or left to the camera's detection (`Auto`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, ::serde::Serialize, ::serde::Deserialize)]
+    #[repr(i32)]
+    pub enum CoolingShellSelectedState {
+        Unknown = 0,
+        Auto    = 1,
+        On      = 2,
+        Off     = 3,
+    }
+    /// What the camera's detection of the cooling shell found
+    /// (`CoolingShellAlgoDetectedState`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, ::serde::Serialize, ::serde::Deserialize)]
+    #[repr(i32)]
+    pub enum CoolingShellAlgoDetectedState {
+        None = 0,
+        On   = 1,
+        Off  = 2,
+    }
+
     #[derive(Clone, PartialEq, ::prost::Message, ::serde::Serialize)]
     pub struct ExtraUserOptions {
         #[prost(string, tag="1")] pub filter: String,
@@ -191,6 +267,8 @@ pub mod extra_metadata {
         #[prost(uint32, tag="2")] pub src_height: u32,
         #[prost(uint32, tag="3")] pub dst_width: u32,
         #[prost(uint32, tag="4")] pub dst_height: u32,
+        #[prost(int32, tag="5")] pub crop_offset_x: i32,
+        #[prost(int32, tag="6")] pub crop_offset_y: i32,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, ::serde::Serialize)]
     #[repr(i32)]
@@ -351,30 +429,49 @@ pub mod extra_metadata {
         #[prost(uint32, tag="1")] pub acc_range: u32,
         #[prost(uint32, tag="2")] pub gyro_range: u32,
     }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, ::serde::Serialize)]
-#[repr(i32)]
-pub enum ExtraType {
-    All          = 0,
-    Metadata     = 1,
-    Thumbnail    = 2,
-    Gyro         = 3,
-    Exposure     = 4,
-    ExtThumbnail = 5,
-    FramePts     = 6,
-    Gps          = 7,
-    StarNum      = 8,
-    AaaData      = 9,
-    Highlight    = 10,
-    AaaSim       = 11,
-    ExposureSecondary = 12,
-    Magnetic     = 13,
-    Euler        = 14,
-    SecGyro      = 15,
-    Speed        = 16,
-    TBox         = 17,
-    Quaternions  = 18,
-    TimeMap      = 128
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, ::serde::Serialize)]
+    #[repr(i32)]
+    pub enum PanoRecordType {
+        Unknown    = 0,
+        SplitFile  = 1,
+        MultiTrack = 2,
+    }
+    /// The vendor's own names: track 0 holds the camera's stream `10`, or its
+    /// stream `00`. Lens 0 is stream `00`, so the first is the reversed order.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, ::serde::Serialize)]
+    #[repr(i32)]
+    pub enum PanoRecordMultiTrackOrder {
+        Unknown           = 0,
+        Track0Stream10    = 1,
+        Track0Stream00    = 2,
+    }
+    /// Where the camera put each lens's pictures.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, ::serde::Serialize)]
+    #[repr(i32)]
+    pub enum StreamType {
+        Unknown             = 0,
+        SingleStreamFile    = 1,
+        /// The two lenses are in two separate files.
+        DualStreamFile      = 2,
+        /// Two video tracks of this file, lens order == track order.
+        DualStreamTrack     = 3,
+        /// Two video tracks of this file, in the opposite order.
+        DualStreamTrackReverse = 4,
+    }
+    /// The offset-string version the camera declares it wrote. The value is an
+    /// enum ordinal and **not** the version number: `V6` is 4, and there is no
+    /// `v4` or `v5` string.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration, ::serde::Serialize)]
+    #[repr(i32)]
+    pub enum OffsetVersion {
+        Unknown = 0,
+        V1      = 1,
+        V2      = 2,
+        V3      = 3,
+        V6      = 4,
+        V8      = 5,
+    }
 }
 
 // ----------------------------------------------------------------------------------------------------------------------
@@ -419,9 +516,16 @@ enum_serializer!(VideoMediaDataRotateAngle, extra_metadata::VideoMediaDataRotate
 enum_serializer!(SensorDevice,              extra_metadata::SensorDevice);
 enum_serializer!(ExpectOutputType,          extra_metadata::ExpectOutputType);
 enum_serializer!(AudioModeType,             extra_metadata::AudioModeType);
+enum_serializer!(PanoRecordType,            extra_metadata::PanoRecordType);
+enum_serializer!(PanoRecordMultiTrackOrder, extra_metadata::PanoRecordMultiTrackOrder);
 enum_serializer!(SubMediaType,              extra_metadata::SubMediaType);
 enum_serializer!(LogoType,                  extra_metadata::extra_user_options::LogoType);
 enum_serializer!(vec OffsetConvertState,    extra_metadata::extra_user_options::OffsetConvertState);
+enum_serializer!(StreamType,                extra_metadata::StreamType);
+enum_serializer!(OffsetState,               OffsetState);
+enum_serializer!(CoolingShellSelectedState, extra_metadata::CoolingShellSelectedState);
+enum_serializer!(CoolingShellAlgoDetectedState, extra_metadata::CoolingShellAlgoDetectedState);
+enum_serializer!(OffsetVersion,             extra_metadata::OffsetVersion);
 
 fn bytes_serializer<S>(x: &[u8], s: S) -> Result<S::Ok, S::Error> where S: serde::Serializer {
     let mut ret = String::with_capacity(x.len() * 2);

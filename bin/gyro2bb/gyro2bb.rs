@@ -33,7 +33,9 @@ fn main() {
     let _time = Instant::now();
 
     let mut stream = std::fs::File::open(&opts.input).unwrap();
-    let filesize = stream.metadata().unwrap().len() as usize;
+    let filesize = stream.metadata().unwrap().len();
+    //dbg!(telemetry_parser::util::get_video_metadata(&mut stream, filesize));
+    //return;
 
     let input = Input::from_stream(&mut stream, filesize, &opts.input, |_|(), Arc::new(AtomicBool::new(false))).unwrap();
 

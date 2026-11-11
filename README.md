@@ -1,6 +1,8 @@
 # telemetry-parser
 A tool to parse real-time metadata embedded in video files or telemetry from other sources.
 
+**[Try online demo](https://gyroflow.xyz/telemetry-viewer/)**: open a file in the browser and see its metadata on a timeline with the video. The file stays on your computer.
+
 # Supported formats:
 - [x] GoPro (HERO 5 and later)
 - [x] Sony (a1, a7c, a7r V, a7 IV, a7s III, a9 II, a9 III, FX3, FX6, FX9, RX0 II, RX100 VII, ZV1, ZV-E10, ZV-E10 II, ZV-E1, a6700)
@@ -9,8 +11,11 @@ A tool to parse real-time metadata embedded in video files or telemetry from oth
 - [x] XTRA (Edge, Edge Pro)
 - [x] Blackmagic RAW (*.braw)
 - [x] RED RAW (V-Raptor, KOMODO) (*.r3d)
+- [x] MotionCam Pro RAW video (*.mcraw)
 - [x] Canon (C50, C80, C400, R6 Mk3, R5 Mk2) (*.mp4, *.mov, *.mxf, *.crm)
+- [x] ARRI (ALEXA 35, ALEXA Mini, ALEXA Mini LF, ALEXA LF, ALEXA 65) (*.mxf, ARRIRAW *.ari, *.arx) - lens, exposure and tilt/roll metadata, no motion data
 - [x] Freefly (Ember)
+- [x] Z CAM (E2-M4 Mk2, E2-S6 Mk2, E2-F6 Mk2, E2-F8 Mk2, E2-M4G Mk2, E2-S6G Mk2 and E2N Mk2) (*.mp4, *.mov, *.zraw)
 - [x] Betaflight blackbox (*.bfl, *.bbl, *.csv)
 - [x] ArduPilot logs (*.bin, *.log)
 - [x] Gyroflow [.gcsv log](https://docs.gyroflow.xyz/app/technical-details/gcsv-format)

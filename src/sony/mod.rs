@@ -3,6 +3,7 @@
 
 pub mod rtmd_tags;
 pub mod mxf;
+pub mod lens_profile;
 
 #[cfg(feature="sony-xml")]
 pub mod xml_metadata;
@@ -70,7 +71,7 @@ impl Sony {
         None
     }
 
-    pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: usize, progress_cb: F, cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
+    pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: u64, progress_cb: F, cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
         let mut header = [0u8; 4];
         stream.read_exact(&mut header)?;
         stream.seek(SeekFrom::Start(0))?;
@@ -95,6 +96,11 @@ impl Sony {
                     }
                 }
             }, cancel_flag)?;
+            if let Some(profile) = lens_profile::read(stream, size) {
+                if let Some(map) = samples.first_mut().and_then(|x| x.tag_map.as_mut()) {
+                    util::insert_tag(map, tag!(parsed GroupId::LensBreathing, TagId::Data, "Lens breathing profile", Json, |v| v.to_string(), profile, Vec::new()), &options);
+                }
+            }
             samples
         };
 
@@ -104,6 +110,7 @@ impl Sony {
     }
 
     fn process_map(&mut self, samples: &mut Vec<SampleInfo>, options: &crate::InputOptions) {
+        let mut cooke_error_logged = false;
         for sample in samples.iter_mut() {
             if let Some(ref mut map) = sample.tag_map {
                 if map.contains_key(&GroupId::Accelerometer) {
@@ -137,15 +144,22 @@ impl Sony {
                     }
                 }
                 if let Some(cooke) = map.get_mut(&GroupId::Cooke) {
+                    // The Cooke /i lens responses are decoded when they're read. Until the clip's first problem, they're checked
+                    // here as well, without building the records, so that it's logged once per clip rather than in every frame
+                    // that is read
+                    if let Some(v) = cooke.get_mut(&TagId::Data) && let TagValue::Unknown(x) = &mut v.value {
+                        let data = std::mem::take(&mut x.raw_data);
+                        if !cooke_error_logged { Self::log_cooke_errors(&crate::cooke::bin::errors(&data), &mut cooke_error_logged); }
+                        v.value = TagValue::Json(ValueType::new(|d| Ok(Self::cooke_records(d.get_ref(), &mut true)), |v| format!("{:?}", v), data));
+                    }
                     let mut cooke_data: Vec<u8> = Vec::new();
                     if let Some(v) = cooke.get(&TagId::Unknown(0xe208)) { if let TagValue::Unknown(x) = &v.value { cooke_data.extend(&x.raw_data); } }
                     if let Some(v) = cooke.get(&TagId::Unknown(0xe209)) { if let TagValue::Unknown(x) = &v.value { cooke_data.extend(&x.raw_data); } }
                     if !cooke_data.is_empty() {
                         cooke.remove(&TagId::Unknown(0xe208));
                         cooke.remove(&TagId::Unknown(0xe209));
-                        cooke.insert(TagId::Data2, tag!(GroupId::Cooke, TagId::Data2, "BinaryMetadata2", Json, "{:?}", |d| {
-                            Ok(serde_json::Value::Array(crate::cooke::bin::parse(d.get_ref()).unwrap())) // TODO: unwrap
-                        }, cooke_data));
+                        if !cooke_error_logged { Self::log_cooke_errors(&crate::cooke::bin::errors(&cooke_data), &mut cooke_error_logged); }
+                        cooke.insert(TagId::Data2, tag!(GroupId::Cooke, TagId::Data2, "BinaryMetadata2", Json, "{:?}", |d| Ok(Self::cooke_records(d.get_ref(), &mut true)), cooke_data));
                     }
                 }
             }
@@ -159,41 +173,77 @@ impl Sony {
         }
     }
 
+    /// The records of the Cooke /i lens responses in `data`, as far as they can be decoded, or null (as a tag that can't be
+    /// parsed) when none can. Their problems are logged ([`Self::log_cooke_errors`])
+    fn cooke_records(data: &[u8], error_logged: &mut bool) -> serde_json::Value {
+        let responses = crate::cooke::bin::parse(data);
+        Self::log_cooke_errors(&responses.errors, error_logged);
+        if responses.records.is_empty() && !responses.errors.is_empty() {
+            return serde_json::Value::Null;
+        }
+        serde_json::Value::Array(responses.records)
+    }
+
+    /// Logs the problems of a clip's Cooke /i lens responses: the first one as a warning, the others (usually the same, in the
+    /// next frames, when they're read) at debug level
+    fn log_cooke_errors(errors: &[Error], error_logged: &mut bool) {
+        for e in errors {
+            if !*error_logged {
+                log::warn!("Sony: {e}");
+                *error_logged = true;
+            } else {
+                log::debug!("Sony: {e}");
+            }
+        }
+    }
+
     fn detect_metadata(data: &[u8]) -> bool {
         data.len() > 0x1C && data[0..2] == [0x00, 0x1C]
     }
 
     pub fn parse_metadata(data: &[u8], options: &crate::InputOptions, map: &mut GroupedTagMap) -> Result<()> {
-        let mut slice = Cursor::new(data);
-        let datalen = data.len() as usize;
+        // The ends of the containers being read, the innermost last: a stack of its own, as a file can nest them as deep as
+        // its bytes allow
+        let mut ends = vec![data.len()];
+        let mut pos = 0;
 
-        while slice.position() < datalen as u64 {
+        while let Some(&datalen) = ends.last() {
+            if pos >= datalen {
+                pos = datalen;
+                ends.pop();
+                continue;
+            }
+            let mut slice = Cursor::new(&data[pos..datalen]);
             let tag = slice.read_u16::<BigEndian>()?;
             if tag == 0x060e {
-                /*let uuid = &data[slice.position() as usize - 2..slice.position() as usize + 14];
+                /*let uuid = &data[pos..pos + 16];
                 log::debug!("--- {} ---", match &uuid[..16] {
                     &hex_literal::hex!("060E2B34 02530101 0C020101 01010000") => "LensUnitMetadata",
                     &hex_literal::hex!("060E2B34 02530101 0C020101 02010000") => "CameraUnitMetadata",
                     &hex_literal::hex!("060E2B34 02530101 0C020101 7F010000") => "UserDefinedAcquisitionMetadata",
                     _ => "Unknown"
                 });*/
-                slice.seek(SeekFrom::Current(14))?;
+                pos += 16;
                 continue;
             }
-            if tag == 0 || tag == 0xffff { break; }
+            if tag == 0 || tag == 0xffff {
+                pos = datalen;
+                continue;
+            }
             let len = slice.read_u16::<BigEndian>()? as usize;
-            let pos = slice.position() as usize;
+            pos += 4;
             if pos + len > datalen {
                 log::warn!("Invalid tag: {:02x}, len: {}, Available: {}", tag, len, datalen - pos);
                 // log::warn!("{}", crate::util::to_hex(&data[pos-4..]));
-                break;
-            }
-            let tag_data = &data[pos..(pos + len)];
-            slice.seek(SeekFrom::Current(len as i64))?;
-            if tag == 0x8300 { // Container
-                Self::parse_metadata(tag_data, options, map)?;
+                pos = datalen;
                 continue;
             }
+            if tag == 0x8300 { // Container
+                ends.push(pos + len);
+                continue;
+            }
+            let tag_data = &data[pos..(pos + len)];
+            pos += len;
             let mut tag_info = get_tag(tag, tag_data);
             tag_info.native_id = Some(tag as u32);
 

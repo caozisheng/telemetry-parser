@@ -63,6 +63,74 @@ pub struct Zcam {
     next_imu_emit_us: Option<f64>,
 
     lens_profile_emitted: bool,
+    /// The clip's and the stream's metadata last exposed, as their bytes: every sample repeats them, and they're exposed
+    /// again only when they change
+    last_clip_meta: Vec<u8>,
+    last_stream_meta: Vec<u8>,
+
+    /// The file's segment table, read before its samples (`crate::segment_table::read`): a file cut from recordings
+    /// times its IMU readings as their source does, by the table (`TableSource::zcam_imu_origin_us`)
+    pub(crate) segment_table: Option<crate::segment_table::Found>,
+    /// How the readings of each of the table's segments are timed (`SourceTiming`), `None` for a segment whose source
+    /// the table gives no IMU origin
+    source_timing: Vec<Option<SourceTiming>>,
+    /// Whether readings of a segment the table can't time were timed from the file's first batch, and reported
+    untimed_reported: bool,
+}
+
+/// How the IMU readings of a segment of a file cut from recordings are timed as its source times them, by the file's
+/// segment table: the source times a reading whose IMU clock value is `c` (its batch's `IMUData.timestamp` plus its
+/// place in the batch) at `c − B₀` µs, `B₀` the source's origin (`zcam_imu_origin_us`, the first batch it times), and
+/// this file's value `c` of the segment is the source's `c + clock_shift`. So the reading is at `c + clock_shift − B₀`
+/// on the source's timeline, which is the file's less `src_capture_start_us` plus `out_capture_start_us`
+#[derive(Debug, Clone, Copy)]
+struct SourceTiming {
+    /// The segment's `clock_shift`, µs of the IMU clock
+    shift_us: i128,
+    /// Where the source's IMU clock wraps, µs, for a clock that does
+    modulus_us: Option<i128>,
+    /// The source's IMU origin `B₀`, µs of its IMU clock
+    origin_us: u64,
+    /// The source's timeline to the file's, µs: `out_capture_start_us − src_capture_start_us`
+    to_file_us: i64,
+}
+
+impl SourceTiming {
+    /// The timing of each segment of `table` whose source has an IMU origin on a µs clock. A segment that continues the
+    /// one before in their source (`SegmentTable::continues`) is one run of the source with it, and is timed as that
+    /// one is, so that the run's readings are where one segment of its frames puts them: its `clock_shift` is that
+    /// one's, and the source's timeline is to the file's as at the run's first segment. The capture times of each
+    /// segment are rounded to the µs on their own, which would move a continuing segment's readings by that rounding
+    /// where its first frame isn't on a whole µs of both timelines
+    fn of_table(table: &crate::segment_table::SegmentTable) -> Vec<Option<Self>> {
+        let mut timings: Vec<Option<Self>> = Vec::with_capacity(table.segments.len());
+        for (r, e) in table.segments.iter().enumerate() {
+            let timing = match timings.last() {
+                Some(run) if table.continues(r) => *run,
+                _ => Self::of_segment(table, e),
+            };
+            timings.push(timing);
+        }
+        timings
+    }
+    /// The timing of a segment of `table` on its own, when its source has an IMU origin on a µs clock
+    fn of_segment(table: &crate::segment_table::SegmentTable, e: &crate::segment_table::TrimSegment) -> Option<Self> {
+        let source = table.source_of(e);
+        let origin_us = source.zcam_imu_origin_us()?;
+        // The origin and the shift are on the source's IMU clock, µs; a `null` shift is a clock the file has as the
+        // source has it
+        let (shift_us, modulus_us) = match (&source.clock, e.clock_shift) {
+            (None, None) => (0, None),
+            (Some(c), Some(d)) if c.rate.1.checked_mul(1_000_000) == Some(c.rate.0) => (d as i128, c.modulus.map(i128::from)),
+            _ => return None,
+        };
+        Some(Self { shift_us, modulus_us, origin_us, to_file_us: e.out_capture_start_us - e.src_capture_start_us })
+    }
+    /// The source's value of this file's IMU clock value `c`
+    fn source_value(&self, c: u64) -> f64 {
+        let v = c as i128 + self.shift_us;
+        self.modulus_us.map_or(v, |m| v.rem_euclid(m)) as f64
+    }
 }
 
 impl Zcam {
@@ -73,7 +141,7 @@ impl Zcam {
         true
     }
     pub fn possible_extensions() -> Vec<&'static str> {
-        vec!["mp4", "mov"]
+        vec!["mp4", "mov", "zraw"]
     }
     pub fn frame_readout_time(&self) -> Option<f64> {
         self.frame_readout_time
@@ -98,9 +166,18 @@ impl Zcam {
         }
     }
 
-    pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: usize, progress_cb: F, cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
+    pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: u64, progress_cb: F, cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
         let mut samples = Vec::new();
         let cancel_flag2 = cancel_flag.clone();
+
+        // A file cut from recordings times its readings as its source does, by its segment table: read first. A probe
+        // reads no table
+        if !options.probe_only {
+            self.segment_table = crate::segment_table::read(stream, size);
+            if let Some(Ok(table)) = &self.segment_table {
+                self.source_timing = SourceTiming::of_table(table);
+            }
+        }
 
         util::get_metadata_track_samples(stream, size, true, |mut info: SampleInfo, data: &[u8], file_position: u64, _video_md: Option<&VideoMetadata>| {
             if size > 0 {
@@ -116,11 +193,24 @@ impl Zcam {
 
             let mut tag_map = GroupedTagMap::new();
 
+            // Each message also whole, raw: its fields beyond the tags taken from it, as the camera wrote them (a frame's
+            // IMU batch, empty when an earlier batch has its readings). The clip's and the stream's, which every sample
+            // repeats, where they change. Gyroflow skips FrameMetadata
             if let Some(ref clip) = parsed.clip_meta {
                 self.process_clip_meta(clip, &mut tag_map, &options);
+                let raw = clip.encode_to_vec();
+                if raw != self.last_clip_meta {
+                    insert_tag(&mut tag_map, util::message_tag("ClipMetadata", "Clip metadata", clip), &options);
+                    self.last_clip_meta = raw;
+                }
             }
             if let Some(ref stream) = parsed.stream_meta {
                 self.process_stream_meta(stream, &mut tag_map, &options);
+                let raw = stream.encode_to_vec();
+                if raw != self.last_stream_meta {
+                    insert_tag(&mut tag_map, util::message_tag("StreamMetadata", "Stream metadata", stream), &options);
+                    self.last_stream_meta = raw;
+                }
             }
             if let Some(ref frame) = parsed.frame_meta {
                 if let Some(ref h) = frame.frame_meta_header {
@@ -129,6 +219,7 @@ impl Zcam {
                     }
                 }
                 self.process_frame_meta(frame, &info, &mut tag_map, &options);
+                insert_tag(&mut tag_map, util::message_tag("FrameMetadata", "Frame metadata", frame), &options);
             }
 
             // Build the lens-profile JSON once, after BOTH:
@@ -276,6 +367,19 @@ impl Zcam {
         }
     }
 
+    /// How the readings of the sample `info` are timed by the file's segment table: as its segment's source times them
+    /// (the segment that presents the middle of the sample), `None` without a table or for a segment it can't time
+    fn timing_of(&mut self, info: &SampleInfo) -> Option<SourceTiming> {
+        let Some(Ok(table)) = &self.segment_table else { return None };
+        let middle_us = ((info.timestamp_ms + info.duration_ms.max(0.0) / 2.0) * 1000.0).round() as i64;
+        let timing = self.source_timing.get(table.segment_of_time_us(middle_us)).copied().flatten();
+        if timing.is_none() && !self.untimed_reported {
+            self.untimed_reported = true;
+            log::warn!("zcam: the segment table gives no IMU origin (zcam_imu_origin_us on a µs clock) for the source of the segment at {:.3} ms: its readings are timed from the file's first IMU batch", middle_us as f64 / 1000.0);
+        }
+        timing
+    }
+
     fn process_frame_meta(&mut self, frame: &FrameMeta, info: &SampleInfo, tag_map: &mut GroupedTagMap, options: &crate::InputOptions) {
         let frame_ts_us = frame.frame_meta_header.as_ref().map(|h| h.frame_timestamp as f64).unwrap_or(0.0);
 
@@ -290,8 +394,11 @@ impl Zcam {
         insert_tag(tag_map, tag!(parsed GroupId::Imager, TagId::CaptureAreaOrigin, "Sensor crop origin", f32x2, |v| format!("{:?}", v), (self.crop_x as f32, self.crop_y as f32), vec![]), options);
         insert_tag(tag_map, tag!(parsed GroupId::Imager, TagId::CaptureAreaSize, "Sensor crop size", f32x2, |v| format!("{:?}", v), (self.crop_w as f32, self.crop_h as f32), vec![]), options);
 
-        let first_frame_ts_ms = frame_ts_us / 1000.0 - info.timestamp_ms;
-        insert_tag(tag_map, tag!(parsed GroupId::Imager, TagId::FirstFrameTimestamp, "First frame timestamp", f64, |v| format!("{:.4} ms", v), first_frame_ts_ms, vec![]), options);
+        // ZRAW firmware leaves FrameMetaHeader empty
+        if frame_ts_us > 0.0 {
+            let first_frame_ts_ms = frame_ts_us / 1000.0 - info.timestamp_ms;
+            insert_tag(tag_map, tag!(parsed GroupId::Imager, TagId::FirstFrameTimestamp, "First frame timestamp", f64, |v| format!("{:.4} ms", v), first_frame_ts_ms, vec![]), options);
+        }
 
         // ----------------- per-frame camera metadata -----------------
         if let Some(ref c) = frame.frame_meta_of_camera {
@@ -379,12 +486,15 @@ impl Zcam {
         // ----------------- IMU data -----------------
         if let Some(ref imu_frame) = frame.frame_meta_of_imu {
             if let Some(ref imu) = imu_frame.imu_data {
-                self.emit_imu_samples(imu, tag_map, options);
+                let timing = if imu.items.is_empty() { None } else { self.timing_of(info) };
+                self.emit_imu_samples(imu, timing, tag_map, options);
             }
         }
     }
 
-    fn emit_imu_samples(&mut self, imu: &ImuData, tag_map: &mut GroupedTagMap, options: &crate::InputOptions) {
+    /// The readings of a batch, timed from the file's first batch, or as their source times them where the file's
+    /// segment table tells how (`timing`)
+    fn emit_imu_samples(&mut self, imu: &ImuData, timing: Option<SourceTiming>, tag_map: &mut GroupedTagMap, options: &crate::InputOptions) {
         let n = imu.items.len();
         if n == 0 { return; }
         if self.imu_sample_rate_hz <= 0.0 {
@@ -411,6 +521,9 @@ impl Zcam {
             self.pts_offset_us = Some(-batch_t0_camera_us);
         }
         let pts_offset_us = self.pts_offset_us.unwrap_or(0.0);
+        // A file cut from recordings: the batch on its source's clock and the source's origin (`SourceTiming`), which
+        // time the readings exactly as the source does, then put on the file's timeline
+        let source = timing.map(|s| (s.source_value(imu.timestamp) - self.imu_time_offset_us, -(s.origin_us as f64 - self.imu_time_offset_us), s.to_file_us as f64));
 
         let mut gyro: Vec<TimeVector3<f64>> = Vec::with_capacity(n);
         let mut acc:  Vec<TimeVector3<f64>> = Vec::with_capacity(n);
@@ -428,7 +541,10 @@ impl Zcam {
                 if t_camera_us < min_t { continue; }
             }
 
-            let t_us = t_camera_us + pts_offset_us;
+            let t_us = match source {
+                Some((batch_t0_source_us, source_offset_us, to_file_us)) => (batch_t0_source_us + (i as f64) * dt_us) + source_offset_us + to_file_us,
+                None => t_camera_us + pts_offset_us,
+            };
             let t_seconds = t_us / 1.0e6;
 
             // Step 1: scale LSB → physical units per the proto's ImuInfo equations.
@@ -663,4 +779,61 @@ fn readout_dir_to_gyroflow_i32(dir: ReadOutDirection) -> i32 {
         ReadOutDirection::LeftToRight => 2,
         ReadOutDirection::RightToLeft => 3,
     }
+}
+
+/// ZRAW files XOR every 32-bit word of the video track's `stco`, version/flags
+/// included, with the `mvhd` creation time. mp4parse then reads a garbage entry
+/// count and fails with UnexpectedEOF, so undo it in place before parsing.
+/// `co64` is assumed to be scrambled the same way, there's no sample of it yet.
+/// `buf` must start at a top-level box, like the buffer built in `util::parse_mp4`.
+pub(crate) fn deobfuscate_zraw_chunk_offsets(buf: &mut [u8]) {
+    let be32 = |b: &[u8], at: usize| u32::from_be_bytes(b[at..at + 4].try_into().unwrap());
+    let child = |b: &[u8], r: &std::ops::Range<usize>, name: &[u8; 4]| child_boxes(b, r.clone()).into_iter().find(|x| &x.0 == name).map(|x| x.1);
+
+    let Some(moov) = child(buf, &(0..buf.len()), b"moov") else { return };
+    let Some(mvhd) = child(buf, &moov, b"mvhd") else { return };
+    if mvhd.len() < 8 || buf[mvhd.start] != 0 { return; } // Only version 0 (32-bit creation time) seen so far
+    let key = be32(buf, mvhd.start + 4);
+    if key == 0 { return; }
+
+    for (name, trak) in child_boxes(buf, moov) {
+        if &name != b"trak" { continue; }
+        let Some(stbl) = [b"mdia", b"minf", b"stbl"].into_iter().try_fold(trak, |r, n| child(buf, &r, n)) else { continue };
+        for (name, co) in child_boxes(buf, stbl) {
+            let entry_size = match &name { b"stco" => 4, b"co64" => 8, _ => continue };
+            // version/flags is 0 in a valid box, so an obfuscated one stores the key itself
+            if co.len() < 8 || be32(buf, co.start) != key { continue; }
+            let count = (be32(buf, co.start + 4) ^ key) as usize;
+            let end = co.start + 8 + count * entry_size;
+            if end > co.end { continue; }
+            for at in (co.start..end).step_by(4) {
+                let raw = be32(buf, at);
+                // A co64 high half is tiny in any real file and the key (seconds since 1904) has its top bits set,
+                // so the smaller of the two is right whether the camera scrambled the high halves or only the low ones
+                let co64_high = entry_size == 8 && at >= co.start + 8 && (at - co.start) % 8 == 0;
+                let v = if co64_high { raw.min(raw ^ key) } else { raw ^ key };
+                buf[at..at + 4].copy_from_slice(&v.to_be_bytes());
+            }
+            log::debug!("zcam: de-obfuscated ZRAW {} with {count} entries, key {key:#010x}", String::from_utf8_lossy(&name));
+        }
+    }
+}
+
+/// (fourcc, payload range) of each box in `range`, stopping at the first malformed one.
+fn child_boxes(buf: &[u8], range: std::ops::Range<usize>) -> Vec<([u8; 4], std::ops::Range<usize>)> {
+    let mut ret = Vec::new();
+    let (mut pos, end) = (range.start, range.end);
+    while pos + 8 <= end {
+        let size = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as u64;
+        let name: [u8; 4] = buf[pos + 4..pos + 8].try_into().unwrap();
+        let (header, size) = match size {
+            0 => (8, (end - pos) as u64),
+            1 if pos + 16 <= end => (16, u64::from_be_bytes(buf[pos + 8..pos + 16].try_into().unwrap())),
+            _ => (8, size),
+        };
+        if size < header as u64 || size > (end - pos) as u64 { break; }
+        ret.push((name, pos + header..pos + size as usize));
+        pos += size as usize;
+    }
+    ret
 }

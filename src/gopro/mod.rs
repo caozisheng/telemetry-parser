@@ -3,7 +3,11 @@
 
 pub mod klv;
 
+mod eac;
+mod fusion;
+mod gps;
 mod lens_profile;
+mod udta;
 
 use std::io::*;
 use std::sync::{ Arc, atomic::AtomicBool };
@@ -18,9 +22,30 @@ use memchr::memmem;
 pub struct GoPro {
     pub model: Option<String>,
     extra_gpmf: Option<GroupedTagMap>,
+    /// The `moov/udta` `GPMF` box, verbatim. Kept beside the flattened
+    /// [`extra_gpmf`](Self::extra_gpmf) because the 360 bodies write the same
+    /// keys under several `DEVC`s and flattening keeps only the last of each.
+    udta_gpmf: Option<Vec<u8>>,
+    /// The clip's own path. A Fusion half says which lens it holds in its NAME
+    /// and nowhere in its bytes, so the detector has to keep it.
+    path: Option<std::path::PathBuf>,
     frame_readout_time: Option<f64>,
     has_cori: bool,
     is_raw_gpmf: bool,
+}
+
+/// The `DEVC` stream of the `moov/udta` `GPMF` box whose fourcc sits at
+/// `key_pos`, i.e. the box less its `[size][GPMF]` header.
+///
+/// `None` for a size field that does not describe a box inside the buffer,
+/// which is what a truncated file hands over — and what used to be an
+/// out-of-range slice.
+fn udta_gpmf(buffer: &[u8], key_pos: usize) -> Option<&[u8]> {
+    let start = key_pos.checked_sub(4)?;
+    let len = (&buffer[start..]).read_u32::<BigEndian>().ok()? as usize;
+    // Eight for the box header and eight more for the `DEVC` KLV the caller is
+    // guaranteed by having matched on it.
+    (len >= 16).then(|| buffer.get(start + 8..start.checked_add(len)?))?
 }
 
 impl GoPro {
@@ -40,7 +65,7 @@ impl GoPro {
         v
     }
 
-    pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], _filepath: P, options: &crate::InputOptions) -> Option<Self> {
+    pub fn detect<P: AsRef<std::path::Path>>(buffer: &[u8], filepath: P, options: &crate::InputOptions) -> Option<Self> {
         let mut ret = None;
 
         if buffer.len() > 8 && &buffer[0..4] == b"DEVC" {
@@ -61,13 +86,15 @@ impl GoPro {
             }
         }
 
-        if let Some(pos) = memmem::find(buffer, b"GPMFDEVC") {
+        if let Some(devices) = memmem::find(buffer, b"GPMFDEVC").and_then(|pos| udta_gpmf(buffer, pos)) {
             let mut obj = Self::default();
-            let mut buf = &buffer[pos-4..];
-            let len = buf.read_u32::<BigEndian>().unwrap() as usize;
-            let gpmf_box = &buf[..len];
 
-            if let Ok(map) = Self::parse_metadata(&gpmf_box[8+8..], GroupId::Default, true, &crate::InputOptions::default()) {
+            // Past the first `DEVC`'s own KLV header, so the walk starts on its
+            // children and every later `DEVC` arrives as a container. Four bytes
+            // further in used to be enough, because a KLV walk that starts
+            // inside a header resynchronises on the next one — at the cost of
+            // the `DVID` it stepped over.
+            if let Ok(map) = Self::parse_metadata(&devices[8..], GroupId::Default, true, &crate::InputOptions::default()) {
                 for v in map.values() {
                     if let Some(v) = v.get_t(TagId::Unknown(0x4D494E46/*MINF*/)) as Option<&String> {
                         obj.model = Some(v.clone());
@@ -79,6 +106,8 @@ impl GoPro {
                 }
                 obj.extra_gpmf = Some(map);
             }
+            // …and the same bytes kept unflattened, for the geometry walk.
+            obj.udta_gpmf = Some(devices.to_vec());
             ret = Some(obj);
         } else if memmem::find(buffer, b"GoPro MET").is_some() {
             ret = Some(Self::default());
@@ -96,19 +125,23 @@ impl GoPro {
                 }
             }
         }
+        if let Some(obj) = &mut ret {
+            obj.path = Some(filepath.as_ref().to_owned());
+        }
         ret
     }
 
-    pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: usize, progress_cb: F, cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
+    pub fn parse<T: Read + Seek, F: Fn(f64)>(&mut self, stream: &mut T, size: u64, progress_cb: F, cancel_flag: Arc<AtomicBool>, options: crate::InputOptions) -> Result<Vec<SampleInfo>> {
         let mut samples = Vec::new();
         if let Some(extra) = &self.extra_gpmf {
             samples.push(SampleInfo { tag_map: Some(extra.clone()), ..Default::default() });
         }
 
         let mut fps = None;
+        let mut video_dim = None;
 
         if self.is_raw_gpmf {
-            let mut data = Vec::with_capacity(size);
+            let mut data = Vec::with_capacity(util::in_memory(size)?);
             stream.read_to_end(&mut data)?;
             for pos in memmem::find_iter(&data, b"DEVC") {
                 let chunk = &data[pos..];
@@ -144,6 +177,14 @@ impl GoPro {
             if !ctx.tracks.is_empty() {
                 fps = util::get_fps_from_track(&ctx.tracks[0]);
             }
+            // The FIRST video track's coded size. Both strips of a `.360` are
+            // the same size and a Fusion half has one track, so one answer
+            // serves every 360 body.
+            video_dim = ctx.tracks.iter()
+                .filter(|x| x.track_type == mp4parse::TrackType::Video)
+                .filter_map(|x| x.tkhd.as_ref())
+                .map(|tkhd| (tkhd.width >> 16, tkhd.height >> 16))
+                .find(|(w, h)| *w > 0 && *h > 0);
         }
         self.process_samples(&mut samples, fps, &options);
 
@@ -161,8 +202,7 @@ impl GoPro {
                             continue; // go inside these boxes
                         } else {
                             if typ == fourcc("SETT") {
-                                let mut buf = vec![0u8; size as usize - header_size as usize];
-                                stream.read_exact(&mut buf)?;
+                                let buf = util::read_box_data(stream, size, header_size)?;
                                 if buf.len() > 8 {
                                     match buf[5] {
                                         0x00 => util::insert_tag(first_map, tag!(parsed GroupId::Default, TagId::Unknown(0x45495341), "EISA", String, |v| v.clone(), "N".into(), vec![]), &options),
@@ -191,6 +231,33 @@ impl GoPro {
         // Build a native lens profile from the in-camera POLY calibration, if present.
         lens_profile::insert_lens_profile(&mut samples, self.model.as_deref(), &options);
 
+        // The camera's own 360 geometry, out of the `udta` box read one device
+        // at a time. It goes at its own tag and never at `Lens/Data`: that one
+        // is the single-lens JSON profile above, tags are last-wins per (group,
+        // id), and a rig-shaped object there would deserialise into an empty
+        // lens profile downstream and then suppress the lens-database lookup.
+        if let (Some(gpmf), Some(dim)) = (self.udta_gpmf.as_deref(), video_dim) {
+            let devices = udta::devices(gpmf, &options);
+            let rig = eac::camera_rig(&devices, dim)
+                .or_else(|| {
+                    fusion::camera_rig(
+                        &devices,
+                        self.model.as_deref(),
+                        self.path.as_deref(),
+                        dim,
+                        crate::rig::readout(self.frame_readout_time),
+                    )
+                });
+            if let Some(camera_rig) = rig {
+                if samples.is_empty() {
+                    samples.push(SampleInfo { tag_map: Some(GroupedTagMap::default()), ..Default::default() });
+                }
+                if let Some(map) = samples[0].tag_map.as_mut() {
+                    util::insert_tag(map, tag!(parsed GroupId::Lens, TagId::Rig, "Camera rig", CameraRig, |v: &crate::rig::CameraRig| serde_json::to_string(v).unwrap_or_default(), camera_rig, vec![]), &options);
+                }
+            }
+        }
+
         Ok(samples)
     }
 
@@ -199,6 +266,19 @@ impl GoPro {
     }
 
     pub fn parse_metadata(data: &[u8], group_id: GroupId, force_group: bool, options: &crate::InputOptions) -> Result<GroupedTagMap> {
+        let mut map = Self::parse_metadata_inner(data, group_id, force_group, options)?;
+        if !force_group {
+            // Retain GPS dependencies until canonicalization, then honor the
+            // caller's exact output selection. Force-grouped metadata stays raw.
+            gps::normalize(&mut map);
+            if let Some(gps) = map.remove(&GroupId::GPS) {
+                for (_, tag) in gps { util::insert_tag(&mut map, tag, options); }
+            }
+        }
+        Ok(map)
+    }
+
+    fn parse_metadata_inner(data: &[u8], group_id: GroupId, force_group: bool, options: &crate::InputOptions) -> Result<GroupedTagMap> {
         let mut slice = Cursor::new(data);
         let datalen = data.len() as u64;
         let mut map = GroupedTagMap::new();
@@ -212,7 +292,8 @@ impl GoPro {
                 let pos = slice.position() as usize;
 
                 let len = klv.data_len();
-                if len == 0 { continue; }
+                // Keep an explicit empty SCAL descriptor so GPS DOP can distinguish it from absent SCAL.
+                if len == 0 && !(!force_group && group_id == GroupId::GPS && &klv.key == b"SCAL") { continue; }
 
                 let full_tag_data = &data[start_pos..(pos + len)];
                 let tag_data      = &data[pos      ..(pos + len)];
@@ -221,7 +302,7 @@ impl GoPro {
 
                 if klv.data_type == 0 { // Container
                     let container_group = if force_group { group_id.clone() } else { KLV::group_from_key(GoPro::get_last_klv(tag_data)?) };
-                    for (g, v) in GoPro::parse_metadata(tag_data, container_group, force_group, options)? {
+                    for (g, v) in GoPro::parse_metadata_inner(tag_data, container_group, force_group, options)? {
                         let group_map = map.entry(g).or_insert_with(TagMap::new);
                         group_map.extend(v);
                     }
@@ -238,13 +319,15 @@ impl GoPro {
                     klv.custom_type = last_type.clone();
                 }
 
+                let gps_options = crate::InputOptions::default();
+                let insert_options = if !force_group && group_id == GroupId::GPS { &gps_options } else { options };
                 util::insert_tag(&mut map, TagDescription {
                     group:       group_id.clone(),
                     id:          klv.tag_id(),
                     description: klv.key_as_string(),
                     value:       klv.parse_data(full_tag_data),
                     native_id:   Some((&klv.key[..]).read_u32::<BigEndian>()?)
-                }, options);
+                }, insert_options);
             } else {
                 break;
             }
@@ -303,6 +386,9 @@ impl GoPro {
     }
 
     fn process_samples(&mut self, samples: &mut Vec<SampleInfo>, fps: Option<f64>, options: &crate::InputOptions) {
+        for sample in samples.iter_mut() {
+            if let Some(map) = sample.tag_map.as_mut() { gps::normalize(map); }
+        }
         // Normalize quaternions
         let mut prev_increment = 0;
         let mut start_timestamp_us = None;
@@ -368,213 +454,87 @@ impl GoPro {
                 let grouped_tag_map = samples[i].tag_map.as_mut().unwrap();
                 util::insert_tag(grouped_tag_map, tag!(parsed GroupId::Quaternion, TagId::Data, "Quaternion data",  Vec_TimeQuaternion_f64, |v| format!("{:?}", v), quat, vec![]), options);
             }
-
-            // Fold raw GPS5 / GPS9 rows into Vec<GpsData> under
-            // GroupId::GPS / TagId::Data, matching what CAMM (mod.rs:176),
-            // Insta360 (record.rs:206), and gyroflow (binary.rs:937) emit.
-            // Downstream telemetry consumers see a single uniform shape
-            // regardless of GoPro model.
-            Self::process_gps_samples(samples, i, options);
         }
     }
-
-    /// Post-process the GPS group in one sample: reads the raw
-    /// `Vec_Vec_i32` rows (GPS5 = 5 columns, GPS9 = 9 columns) plus SCAL /
-    /// GPSU / GPSF, and replaces `GroupId::GPS / TagId::Data` with a
-    /// pre-scaled `Vec<GpsData>` — the same shape emitted by CAMM /
-    /// Insta360 / gyroflow. Non-GoPro brands are untouched.
-    fn process_gps_samples(samples: &mut Vec<SampleInfo>, i: usize, options: &crate::InputOptions) {
-        let info = &samples[i];
-        let Some(tag_map) = info.tag_map.as_ref() else { return; };
-        let Some(gps_map) = tag_map.get(&GroupId::GPS) else { return; };
-        let Some(data_desc) = gps_map.get(&TagId::Data) else { return; };
-
-        // GPS5 (legacy: `data_type=b'l'` homogeneous i32) lands as
-        // `Vec_Vec_i32`. GPS9 (HERO11+: `data_type=b'?'` heterogeneous
-        // struct with a preceding `TYPE` descriptor) lands as
-        // `Vec_Vec_Scalar` because its columns mix i32/u32/u16/etc. We
-        // normalise both into `Vec<Vec<i64>>` so the downstream scaling
-        // logic doesn't care.
-        let (rows, is_gps9): (Vec<Vec<i64>>, bool) =
-            match (&data_desc.value, data_desc.description.as_str()) {
-                (TagValue::Vec_Vec_i32(v), "GPS5") => (
-                    v.get().iter().map(|r| r.iter().map(|x| *x as i64).collect()).collect(),
-                    false,
-                ),
-                (TagValue::Vec_Vec_i32(v), "GPS9") => (
-                    v.get().iter().map(|r| r.iter().map(|x| *x as i64).collect()).collect(),
-                    true,
-                ),
-                (TagValue::Vec_Vec_Scalar(v), "GPS9") => (
-                    v.get()
-                        .iter()
-                        .map(|r| r.iter().map(Self::scalar_to_i64).collect())
-                        .collect(),
-                    true,
-                ),
-                _ => return,
-            };
-
-        if rows.is_empty() {
-            return;
-        }
-
-        // SCAL divisors. Read the file's own SCAL; default to spec values
-        // per column when absent so synthetic tests without SCAL still work.
-        let scal: Vec<f64> = match gps_map.get(&TagId::Scale).map(|d| &d.value) {
-            Some(TagValue::Vec_i32(v)) => v.get().iter().map(|x| *x as f64).collect(),
-            Some(TagValue::Vec_u32(v)) => v.get().iter().map(|x| *x as f64).collect(),
-            Some(TagValue::Vec_i16(v)) => v.get().iter().map(|x| *x as f64).collect(),
-            Some(TagValue::Vec_u16(v)) => v.get().iter().map(|x| *x as f64).collect(),
-            Some(TagValue::Vec_Scalar(v)) => v.get().iter().map(Self::scalar_to_f64).collect(),
-            _ => Vec::new(),
-        };
-        let scale = |col: usize, default: f64| -> f64 {
-            scal.get(col).copied().filter(|v| *v > 0.0).unwrap_or(default)
-        };
-
-        // GPSU: frame-level UTC (ms since Unix epoch, u64 from KLV 'U').
-        // GPS5 only — GPS9 has per-row timestamps.
-        const GPSU_FOURCC: u32 = u32::from_be_bytes(*b"GPSU");
-        // GPSF: fix status. 0 = no lock, 2 = 2D, 3 = 3D. u32.
-        const GPSF_FOURCC: u32 = u32::from_be_bytes(*b"GPSF");
-        let gpsu_ms: Option<u64> = gps_map.get_t(TagId::Unknown(GPSU_FOURCC)).copied();
-        let gpsf: Option<u32> = gps_map.get_t(TagId::Unknown(GPSF_FOURCC)).copied();
-
-        // 2000-01-01T00:00:00Z as Unix epoch — GPS9 origin.
-        const EPOCH_2000_UNIX_S: i64 = 946_684_800;
-
-        let mut gps = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let needed = if is_gps9 { 9 } else { 5 };
-            if row.len() < needed {
-                continue;
-            }
-
-            let lat = row[0] as f64 / scale(0, 1e7);
-            let lon = row[1] as f64 / scale(1, 1e7);
-            let alt = row[2] as f64 / scale(2, 1e3);
-            let speed = row[3] as f64 / scale(3, 1e3);
-
-            let (unix_ts_s, acquired) = if is_gps9 {
-                let days = row[5];
-                let secs_ms = row[6] as f64 / scale(6, 1e3);
-                let fix_col = row[8];
-                let t = EPOCH_2000_UNIX_S as f64 + days as f64 * 86_400.0 + secs_ms;
-                // HERO11 sometimes emits row[8]=0 and relies on the
-                // frame-level GPSF for lock status. Accept a row if
-                // EITHER source reports 2D/3D lock.
-                let acquired = fix_col >= 2 || gpsf.map(|f| f >= 2).unwrap_or(false);
-                (t, acquired)
-            } else {
-                let t = gpsu_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
-                (t, gpsf.map(|f| f >= 2).unwrap_or(t > 0.0))
-            };
-
-            // GPMF GPS9 column 7 = DOP × 100 (unitless). Divide by
-            // SCAL(7) which defaults to 100 (spec value). GPS5 has no
-            // DOP column → None.
-            let dop = if is_gps9 {
-                let raw = row[7] as f64 / scale(7, 1e2);
-                // Sentinel: raw = 0 means the receiver hadn't finished
-                // a DOP computation; treat as unknown rather than
-                // "perfect".
-                if raw > 0.0 { Some(raw) } else { None }
-            } else {
-                None
-            };
-
-            gps.push(GpsData {
-                is_acquired: acquired,
-                unix_timestamp: unix_ts_s,
-                lat,
-                lon,
-                speed,
-                track: 0.0,
-                altitude: alt,
-                dop,
-            });
-        }
-
-        let grouped_tag_map = samples[i].tag_map.as_mut().unwrap();
-        util::insert_tag(
-            grouped_tag_map,
-            tag!(parsed GroupId::GPS, TagId::Data, "GPS data", Vec_GpsData, |v| format!("{:?}", v), gps, vec![]),
-            options,
-        );
+    /// Preserve the relative start of each sensor on the shared GPMF clock.
+    /// GoPro's GPMF_utils uses a video-associated timestamp when available,
+    /// otherwise the earliest STMP in the first payload as its clock origin.
+    /// Starting gyro and acceleration independently at zero loses tens of ms
+    /// on Fusion (and aligns measurements from different instants).
+    pub(crate) fn imu_start_times_ms(samples: &[SampleInfo]) -> (f64, f64, f64) {
+        let first = samples.iter().filter_map(|s| s.tag_map.as_ref().map(|m| (s, m)))
+            .find(|(_, m)| m.contains_key(&GroupId::Gyroscope));
+        let Some((packet, tags)) = first else { return (0.0, 0.0, 0.0) };
+        let stamp = |g: &TagMap| (g.get_t(TagId::TimestampUs) as Option<&u64>).copied().filter(|v| *v > 0);
+        // The streams of the video frames, whose stamps GPMF_utils' callers pass as the time base: the exposure time
+        // (SHUT), which gpmf-parser's demo takes, else the sensor ISO (ISOE), both written once per frame
+        let video = [KLV::group_from_key(b"SHUT"), KLV::group_from_key(b"ISOE")].iter()
+            .find_map(|g| tags.get(g).and_then(stamp));
+        // Without STMP the readings start with the packet, at its time in the clip
+        let packet_ms = packet.timestamp_ms;
+        let Some(base) = video.or_else(|| tags.values().filter_map(stamp).min()) else { return (packet_ms, packet_ms, packet_ms) };
+        let offset = |group: GroupId| samples.iter().filter_map(|s| s.tag_map.as_ref()?.get(&group))
+            .find_map(stamp).map_or(packet_ms, |t| packet_ms + (t as f64 - base as f64) / 1000.0);
+        (offset(GroupId::Gyroscope), offset(GroupId::Accelerometer), offset(GroupId::Magnetometer))
     }
 
-    /// Extract an i64 out of a `Scalar` — the KLV parser's canonical
-    /// heterogeneous value cell. Every integer variant widens losslessly
-    /// to i64; floats truncate toward zero (acceptable for the DOP/fix
-    /// columns where fractional values don't occur in practice).
-    fn scalar_to_i64(s: &Scalar) -> i64 {
-        match *s {
-            Scalar::i8(v)  => v as i64,
-            Scalar::u8(v)  => v as i64,
-            Scalar::i16(v) => v as i64,
-            Scalar::u16(v) => v as i64,
-            Scalar::i32(v) => v as i64,
-            Scalar::u32(v) => v as i64,
-            Scalar::i64(v) => v,
-            Scalar::u64(v) => v as i64,
-            Scalar::f32(v) => v as i64,
-            Scalar::f64(v) => v as i64,
-            _ => 0,
-        }
+    /// The camera clock's time of a packet's readings of one sensor, in µs: its STMP, or the millisecond stamps of
+    /// the cameras before it (TimestampMs, TICK)
+    pub(crate) fn stamp_us(map: &TagMap) -> Option<i64> {
+        (map.get_t(TagId::TimestampUs) as Option<&u64>).map(|t| *t as i64)
+            .or_else(|| (map.get_t(TagId::TimestampMs) as Option<&u64>).map(|t| (*t as i64) * 1000))
+            .or_else(|| (map.get_t(TagId::Unknown(0x5449434b /*TICK*/)) as Option<&u32>).map(|t| (*t as i64) * 1000))
     }
 
-    /// Same widening for scaling factors — SCAL values are typically
-    /// small positive integers, so f64 is exact.
-    fn scalar_to_f64(s: &Scalar) -> f64 {
-        match *s {
-            Scalar::i8(v)  => v as f64,
-            Scalar::u8(v)  => v as f64,
-            Scalar::i16(v) => v as f64,
-            Scalar::u16(v) => v as f64,
-            Scalar::i32(v) => v as f64,
-            Scalar::u32(v) => v as f64,
-            Scalar::i64(v) => v as f64,
-            Scalar::u64(v) => v as f64,
-            Scalar::f32(v) => v as f64,
-            Scalar::f64(v) => v,
-            _ => 0.0,
-        }
-    }
     pub fn get_avg_sample_duration(samples: &Vec<SampleInfo>, group_id: &GroupId) -> Option<f64> {
+        // Without stamps, the time of the packets that hold readings of the sensor: its readings span them. A packet that the
+        // track delivers without any, whose stream of the sensor is empty (as cameras write them) or missing, is no time of
+        // theirs, as the timeline puts the readings after it at their own packet's time (`util::time_before_readings`)
         let mut total_duration_ms = 0.0;
 
-        let mut first_tsus = None;
-        let mut last_tsus = None;
+        // The readings between one packet's timestamp and the next one's, over the packets the track delivered one
+        // after another: across packets it didn't deliver (`util::time_missing_between`) the time between the stamps
+        // is also theirs, whose readings aren't here. A packet without readings starts no such span, as the time from
+        // its stamp to the next one is none of theirs: the sensor gave none then. Cameras write an empty stream without
+        // a stamp (a HERO8 whose IMU stops after its first packet keeps a TSMP and nothing else), but a stamp there
+        // would put the time to the next one on no readings. Their counts are the readings delivered rather than the
+        // TSMP totals, which some packets of a HERO5 Session and a HERO10 raise by 4 to 12 fewer than they hold
+        let mut stamped_us = 0i64;
+        let mut stamped_count = 0;
+        let mut previous: Option<(&SampleInfo, i64, usize)> = None;
         let mut count = 0;
-        let mut last_len = 0;
         for info in samples {
-            total_duration_ms += info.duration_ms;
             if info.tag_map.is_none() { continue; }
             for (group, map) in info.tag_map.as_ref().unwrap() {
                 if group == group_id {
-                    if let Some(t) = map.get_t(TagId::TimestampUs) as Option<&u64> {
-                        if first_tsus.is_none() { first_tsus = Some(*t as i64); }
-                        last_tsus = Some(*t as i64);
-                    } else if let Some(t) = map.get_t(TagId::TimestampMs) as Option<&u64> {
-                        if first_tsus.is_none() { first_tsus = Some((*t as i64) * 1000); }
-                        last_tsus = Some((*t as i64) * 1000);
-                    } else if let Some(t) = map.get_t(TagId::Unknown(0x5449434b /*TICK*/)) as Option<&u32> {
-                        if first_tsus.is_none() { first_tsus = Some((*t as i64) * 1000); }
-                        last_tsus = Some((*t as i64) * 1000);
-                    }
+                    let tsus = Self::stamp_us(map);
+                    let mut len = 0;
                     if let Some(t) = map.get_t(TagId::Data) as Option<&Vec<Vector3<i16>>> {
-                        count += t.len();
-                        last_len = t.len();
+                        len = t.len();
+                    } else if let Some(t) = map.get_t(TagId::Data) as Option<&Vec<Vector3<f32>>> {
+                        // Fusion stores floating-point IMU readings. Their clock
+                        // uses the same STMP/TICK and sample-count rule as i16.
+                        len = t.len();
                     } else if let Some(t) = map.get_t(TagId::Data) as Option<&Vec<Quaternion<i16>>> {
-                        count += t.len();
-                        last_len = t.len();
+                        len = t.len();
+                    }
+                    count += len;
+                    if len > 0 {
+                        total_duration_ms += info.duration_ms;
+                    }
+                    if let Some(tsus) = tsus {
+                        if let Some((previous_info, previous_tsus, previous_len)) = previous
+                            && previous_len > 0 && util::time_missing_between(previous_info, info) == 0.0 {
+                            stamped_us += tsus - previous_tsus;
+                            stamped_count += previous_len;
+                        }
+                        previous = Some((info, tsus, len));
                     }
                 }
             }
         }
-        if first_tsus.is_some() && last_tsus.is_some() && count > 0 && last_tsus.unwrap() > first_tsus.unwrap() {
-            Some((last_tsus.unwrap() as f64 - first_tsus.unwrap() as f64) / (count - last_len).max(1) as f64 / 1000.0)
+        if stamped_us > 0 && stamped_count > 0 {
+            Some(stamped_us as f64 / stamped_count as f64 / 1000.0)
         } else if count > 0 {
             Some(total_duration_ms / count as f64)
         } else {
@@ -609,175 +569,33 @@ impl GoPro {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util;
-    use std::collections::BTreeMap;
 
-    fn fmt_vec_vec_i32(v: &Vec<Vec<i32>>) -> String { format!("{:?}", v) }
-    fn fmt_vec_i32(v: &Vec<i32>) -> String { format!("{:?}", v) }
-    fn fmt_u64(v: &u64) -> String { format!("{}", v) }
-    fn fmt_u32(v: &u32) -> String { format!("{}", v) }
-    fn fmt_vec_vec_scalar(v: &Vec<Vec<Scalar>>) -> String { format!("{:?}", v) }
-
-    fn make_sample(tags: Vec<(GroupId, TagId, String, TagValue)>) -> util::SampleInfo {
-        let mut map: GroupedTagMap = BTreeMap::new();
-        for (g, id, description, value) in tags {
-            let desc = TagDescription {
-                group: g.clone(),
-                id: id.clone(),
-                native_id: None,
-                description,
-                value,
-            };
-            map.entry(g).or_default().insert(id, desc);
+    /// Packet `index` of a GPMF track, a second long: a gyro stream with its TSMP, `readings` readings when it has data,
+    /// and its STMP when `stamped`, on a camera clock 37 µs ahead of the track's
+    fn packet(index: u64, readings: Option<usize>, stamped: bool) -> SampleInfo {
+        let options = crate::InputOptions::default();
+        let mut map = GroupedTagMap::new();
+        util::insert_tag(&mut map, tag!(parsed GroupId::Gyroscope, TagId::Count, "TSMP", u32, |v| v.to_string(), (index as u32 + 1) * 200, vec![]), &options);
+        if let Some(n) = readings {
+            util::insert_tag(&mut map, tag!(parsed GroupId::Gyroscope, TagId::Data, "GYRO", Vec_Vector3_i16, |v| format!("{:?}", v), vec![Vector3 { x: 1, y: -2, z: 3 }; n], vec![]), &options);
         }
-        util::SampleInfo {
-            tag_map: Some(map),
-            ..Default::default()
+        if stamped {
+            util::insert_tag(&mut map, tag!(parsed GroupId::Gyroscope, TagId::TimestampUs, "STMP", u64, |v| v.to_string(), index * 1_000_000 + 37, vec![]), &options);
         }
+        SampleInfo { sample_index: index, timestamp_ms: index as f64 * 1000.0, duration_ms: 1000.0, tag_map: Some(map), ..Default::default() }
     }
 
     #[test]
-    fn process_gps_samples_gps9_hero11() {
-        // Layout per gopro/gpmf-parser: 9 int32 columns
-        //   [lat, lon, alt, spd2d, spd3d, days_since_2000, ms_since_midnight, DOP, fix]
-        // Row 1: acquired 3D fix at 2023-11-14T12:26:40Z
-        //   days_since_2000 = 8718
-        //   secs_since_midnight = 44_800 ⇒ ms = 44_800_000
-        //   → unix_ts_s = 946_684_800 + 8718 * 86_400 + 44_800 = 1_700_000_000
-        // Row 2: fix=0 must be dropped
-        // Row 3: acquired 3D fix at +0.2 s
-        let rows = vec![
-            vec![312_304_000, 1_214_737_000, 10_000, 5_000, 5_100, 8718, 44_800_000, 100, 3],
-            vec![0, 0, 0, 0, 0, 8718, 44_800_100, 100, 0],
-            vec![312_305_000, 1_214_738_000, 11_000, 4_500, 4_600, 8718, 44_800_200, 100, 3],
-        ];
-        const GPS9_FOURCC: u32 = u32::from_be_bytes(*b"GPS9");
-        let mut samples = vec![make_sample(vec![
-            (GroupId::GPS, TagId::Data, "GPS9".into(),
-                TagValue::Vec_Vec_i32(ValueType::new_parsed(fmt_vec_vec_i32, rows, vec![]))),
-            (GroupId::GPS, TagId::Scale, "SCAL".into(),
-                TagValue::Vec_i32(ValueType::new_parsed(fmt_vec_i32,
-                    vec![10_000_000, 10_000_000, 1_000, 1_000, 1_000, 1, 1_000, 100, 1],
-                    vec![]))),
-        ])];
-
-        let _ = GPS9_FOURCC; // reserved for future direct-tag lookups
-        GoPro::process_gps_samples(&mut samples, 0, &crate::InputOptions::default());
-
-        let map = samples[0].tag_map.as_ref().unwrap();
-        let gps_map = map.get(&GroupId::GPS).unwrap();
-        let out: &Vec<GpsData> = gps_map.get_t(TagId::Data).expect("GPS Vec_GpsData missing");
-        assert_eq!(out.len(), 3, "process_gps_samples keeps every row incl. unlocked");
-        assert!(out[0].is_acquired);
-        assert!(!out[1].is_acquired, "fix=0 → not acquired");
-        assert!(out[2].is_acquired);
-        assert!((out[0].lat - 31.2304).abs() < 1e-9);
-        assert!((out[0].lon - 121.4737).abs() < 1e-9);
-        assert!((out[0].altitude - 10.0).abs() < 1e-9);
-        assert!((out[0].speed - 5.0).abs() < 1e-9);
-        // 2023-11-14T12:26:40Z: 8718 days since 2000-01-01 + 44_800 s.
-        // Unix = 946_684_800 + 8718 * 86_400 + 44_800 = 1_699_964_800.
-        assert!((out[0].unix_timestamp - 1_699_964_800.0).abs() < 1e-3);
-        assert!((out[2].unix_timestamp - 1_699_964_800.200).abs() < 1e-3);
-        // DOP col=100 with SCAL(7)=100 → HDOP=1.0
-        assert!((out[0].dop.unwrap() - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn process_gps_samples_gps5_legacy() {
-        // Legacy GPS5 (HERO5–HERO10): 5 int32 columns
-        //   [lat, lon, alt, spd2d, spd3d]
-        //   frame-level timestamp from GPSU (ms), fix from GPSF.
-        let rows = vec![
-            vec![312_304_000, 1_214_737_000, 10_000, 5_000, 51_000],
-            vec![312_305_000, 1_214_738_000, 11_000, 4_500, 46_000],
-        ];
-        const GPSU_FOURCC: u32 = u32::from_be_bytes(*b"GPSU");
-        const GPSF_FOURCC: u32 = u32::from_be_bytes(*b"GPSF");
-        let mut samples = vec![make_sample(vec![
-            (GroupId::GPS, TagId::Data, "GPS5".into(),
-                TagValue::Vec_Vec_i32(ValueType::new_parsed(fmt_vec_vec_i32, rows, vec![]))),
-            (GroupId::GPS, TagId::Scale, "SCAL".into(),
-                TagValue::Vec_i32(ValueType::new_parsed(fmt_vec_i32,
-                    vec![10_000_000, 10_000_000, 1_000, 1_000, 100],
-                    vec![]))),
-            (GroupId::GPS, TagId::Unknown(GPSU_FOURCC), "GPSU".into(),
-                TagValue::u64(ValueType::new_parsed(fmt_u64, 1_700_000_000_000_u64, vec![]))),
-            (GroupId::GPS, TagId::Unknown(GPSF_FOURCC), "GPSF".into(),
-                TagValue::u32(ValueType::new_parsed(fmt_u32, 3_u32, vec![]))),
-        ])];
-
-        GoPro::process_gps_samples(&mut samples, 0, &crate::InputOptions::default());
-
-        let map = samples[0].tag_map.as_ref().unwrap();
-        let gps_map = map.get(&GroupId::GPS).unwrap();
-        let out: &Vec<GpsData> = gps_map.get_t(TagId::Data).expect("GPS Vec_GpsData missing");
-        assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|g| g.is_acquired), "GPSF=3 => all locked");
-        assert!((out[0].lat - 31.2304).abs() < 1e-9);
-        assert!((out[0].lon - 121.4737).abs() < 1e-9);
-        assert!((out[0].altitude - 10.0).abs() < 1e-9);
-        assert!((out[0].speed - 5.0).abs() < 1e-9);
-        assert!((out[0].unix_timestamp - 1_700_000_000.0).abs() < 1e-3);
-        // GPS5 has no DOP column → None
-        assert!(out[0].dop.is_none());
-    }
-
-    #[test]
-    fn process_gps_samples_no_gps_group_noop() {
-        let mut samples = vec![make_sample(vec![])];
-        GoPro::process_gps_samples(&mut samples, 0, &crate::InputOptions::default());
-        let map = samples[0].tag_map.as_ref().unwrap();
-        assert!(map.get(&GroupId::GPS).is_none(), "no GPS group should stay absent");
-    }
-
-    /// Real HERO11 firmware emits GPS9 as `Vec_Vec_Scalar` because the
-    /// KLV parser dispatches on `data_type = b'?'` (heterogeneous struct
-    /// preceded by a TYPE descriptor). This test covers the production
-    /// wire shape — synthetic i32 rows are handy but don't exercise the
-    /// path real files take.
-    #[test]
-    fn process_gps_samples_gps9_vec_vec_scalar() {
-        // Same numeric content as the Vec_Vec_i32 GPS9 test, but wrapped
-        // in Scalar so the (TagValue::Vec_Vec_Scalar, "GPS9") arm fires.
-        // Column 8 (fix) demonstrates u32 → i64 widening.
-        let scalar_row = |lat: i32, lon: i32, alt: i32, s2d: i32, s3d: i32,
-                          days: i32, ms: i32, dop: i32, fix: u32| -> Vec<Scalar> {
-            vec![
-                Scalar::i32(lat), Scalar::i32(lon), Scalar::i32(alt),
-                Scalar::i32(s2d), Scalar::i32(s3d),
-                Scalar::i32(days), Scalar::i32(ms),
-                Scalar::i32(dop), Scalar::u32(fix),
-            ]
-        };
-        let rows = vec![
-            scalar_row(312_304_000, 1_214_737_000, 10_000, 5_000, 5_100, 8718, 44_800_000, 100, 3),
-            scalar_row(0, 0, 0, 0, 0, 8718, 44_800_100, 100, 0),
-            scalar_row(312_305_000, 1_214_738_000, 11_000, 4_500, 4_600, 8718, 44_800_200, 100, 3),
-        ];
-        let mut samples = vec![make_sample(vec![
-            (GroupId::GPS, TagId::Data, "GPS9".into(),
-                TagValue::Vec_Vec_Scalar(ValueType::new_parsed(fmt_vec_vec_scalar, rows, vec![]))),
-            (GroupId::GPS, TagId::Scale, "SCAL".into(),
-                TagValue::Vec_i32(ValueType::new_parsed(fmt_vec_i32,
-                    vec![10_000_000, 10_000_000, 1_000, 1_000, 1_000, 1, 1_000, 100, 1],
-                    vec![]))),
-        ])];
-
-        GoPro::process_gps_samples(&mut samples, 0, &crate::InputOptions::default());
-
-        let map = samples[0].tag_map.as_ref().unwrap();
-        let gps_map = map.get(&GroupId::GPS).unwrap();
-        let out: &Vec<GpsData> = gps_map.get_t(TagId::Data).expect("GPS Vec_GpsData missing");
-        assert_eq!(out.len(), 3, "Vec_Vec_Scalar path must produce every row");
-        assert!(out[0].is_acquired, "fix=3 in Scalar::u32 must widen and gate correctly");
-        assert!(!out[1].is_acquired, "fix=0 → not acquired even in Scalar form");
-        assert!(out[2].is_acquired);
-        assert!((out[0].lat - 31.2304).abs() < 1e-9);
-        assert!((out[0].lon - 121.4737).abs() < 1e-9);
-        assert!((out[0].altitude - 10.0).abs() < 1e-9);
-        assert!((out[0].unix_timestamp - 1_699_964_800.0).abs() < 1e-3);
-        // DOP col=100 with SCAL(7)=100 → HDOP=1.0
-        assert!((out[0].dop.unwrap() - 1.0).abs() < 1e-9);
+    fn readings_are_timed_by_the_stamps_of_the_packets_that_hold_them() {
+        let duration = |packets: Vec<SampleInfo>| GoPro::get_avg_sample_duration(&packets, &GroupId::Gyroscope);
+        let full = |index| packet(index, Some(200), true);
+        assert_eq!(duration((0..4).map(full).collect()), Some(5.0));
+        // A packet the track didn't deliver: the time between the stamps around it is also that of its readings
+        assert_eq!(duration(vec![full(0), full(1), full(3)]), Some(5.0));
+        // A stamped stream without readings: the time to the next stamp is none of theirs
+        assert_eq!(duration(vec![full(0), full(1), packet(2, Some(0), true), full(3)]), Some(5.0));
+        // A sensor that stops after the first packet, whose streams are then empty and unstamped, as a HERO8 writes them
+        assert_eq!(duration(vec![full(0), packet(1, None, false), packet(2, None, false)]), Some(5.0));
+        assert_eq!(duration(vec![packet(0, None, true), packet(1, Some(0), true)]), None);
     }
 }

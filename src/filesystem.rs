@@ -23,7 +23,7 @@ pub fn get_filename(path: &str) -> String {
         return (funcs.get_filename)(path);
     }
     let mut filename = path;
-    if let Some(pos) = path.rfind('/').or_else(|| path.rfind('\\')) {
+    if let Some(pos) = path.rfind(['/', '\\']) {
         filename = &path[pos + 1..];
     }
     filename.to_owned()
@@ -34,7 +34,7 @@ pub fn get_folder(path: &str) -> String {
         return (funcs.get_folder)(path);
     }
     if !path.ends_with('/') && !path.ends_with('\\') {
-        if let Some(pos) = path.rfind('/').or_else(|| path.rfind('\\')) {
+        if let Some(pos) = path.rfind(['/', '\\']) {
             return path[..pos].to_owned();
         }
     }
@@ -81,14 +81,14 @@ impl<T: std::io::Read + std::io::Seek> ReadSeek for T {}
 
 pub struct FileWrapper {
     pub file: Box<dyn ReadSeek>,
-    pub size: usize,
+    pub size: u64,
 }
 pub fn open_file(path: &str) -> std::io::Result<FileWrapper> {
     if let Some(funcs) = FILESYSTEM_FUNCTIONS.get() {
         return (funcs.open_file)(path);
     }
     let file = std::fs::File::open(path)?;
-    let size = file.metadata()?.len() as usize;
+    let size = file.metadata()?.len();
     Ok(FileWrapper { file: Box::new(file), size })
 }
 
@@ -102,7 +102,7 @@ pub fn get_extension(path: &str) -> String {
 
 pub fn read_file(path: &str) -> std::io::Result<Vec<u8>> {
     let mut wrapper = open_file( path)?;
-    let mut bytes = Vec::with_capacity(wrapper.size);
+    let mut bytes = Vec::with_capacity(crate::util::in_memory(wrapper.size)?);
     wrapper.file.read_to_end(&mut bytes)?;
     Ok(bytes)
 }

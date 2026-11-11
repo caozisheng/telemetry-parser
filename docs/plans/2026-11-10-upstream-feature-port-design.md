@@ -66,6 +66,57 @@
 
 GPS9 时间采用 2000 年 epoch 加日期/日内时间，GPS5 使用 GPSU。保留无定位行，通过 is_acquired 标识。GPS9 行级 fix 与 frame-level GPSF 的优先级需结合协议/真实样例验证；旧 fork 的 OR 规则作为兼容候选，不作为未经验证的协议结论。GPS5 同包多点时间精度限制需明确，不在此次同步中凭空推断时间。
 
+### Task 4 implementation decisions (2026-11-10)
+
+- GPS9 now maps to GPS/Data alongside GPS5. A focused postprocessor changes only
+  supported GPS Data values, retaining the original description/native ID and
+  companion tags. Wire tests exercise DEVC/STRM, TYPE, single `Vec_Scalar`, multiple
+  `Vec_Vec_Scalar`, and homogeneous i32 rows through the real KLV dispatcher.
+- Canonical `GpsData.speed` remains **km/h**, as documented in `tags_impl.rs` and
+  consumed by the upstream viewer. GPMF's scaled 2D speed is m/s, so 5000/1000
+  becomes 18 km/h, not the old fork's 5. This deliberately fixes the fork's unit
+  mismatch; it is **not drop-in speed compatibility with rimecut-public**.
+- Read-only consumer inspection at `37db9e37dc8359371ad1261766226b2d264c9573`
+  confirms `rust/crates/media-telemetry-parser/src/convert.rs::extract_gps` copies
+  `gps.speed` without conversion. Its raw STRM tests expect 4.732 m/s, and
+  `packages/media-telemetry/src/__tests__/channels.test.ts` explicitly tests m/s
+  pass-through. `plugin-map-view` multiplies `speedMps` by 3.6 for display.
+  **Integration/release blocker:** consumer `extract_gps` must convert canonical
+  km/h to m/s (divide by 3.6) and update its raw STRM expectations before adopting
+  this candidate. No consumer files were modified. Keeping m/s only for GoPro
+  would silently violate the common GpsData contract and was rejected.
+- GPS9 time = Unix epoch 2000 + scaled days * 86400 + scaled seconds-of-day;
+  floating Scalar cells retain fractions rather than truncating through i64.
+  GPS5 uses GPSU seconds for every row in the packet; absent GPSU gives numeric
+  sentinel 0, without inventing intra-packet times or inferring lock from UTC.
+- Only exact fix values 2 and 3 mean acquired. GPS5 requires GPSF; missing GPSF
+  stays unacquired even when UTC exists (safer than the fork's time-based guess).
+  GPS9 preserves the fork's row-fix OR frame-GPSF compatibility policy, bounded
+  to known fix codes. Tests cover row 0/frame 3, row 3/frame 0, neither, missing
+  frame status, and unknown 99. This avoids losing fork-recognized frame-lock
+  rows, but no real HERO11 sample establishes protocol precedence: a frame lock
+  can mark an individually unlocked row acquired. Treat this as a compatibility
+  policy, not proven receiver-level truth.
+- Positive finite SCAL divisors are honored (including scalar common scale).
+  Missing, partial, nonpositive or nonfinite divisors fall back per column to
+  the fork's usual GPS defaults. Thus missing SCAL is best-effort, not proof of
+  a device's units. Unknown Data types remain untouched; short/nonfinite rows
+  are skipped; well-formed unlocked rows are retained. Already-normalized data
+  is unchanged. This is not general malformed-KLV parser hardening.
+- Normal (non-force-grouped) KLV parsing temporarily retains GPS dependencies,
+  canonicalizes GPS Data, then applies the caller's exact whitelist/blacklist.
+  Data-only selection and dependency blacklisting must not change canonical
+  coordinates, speed, UTC, or fix (including GPS9 frame-fix compatibility).
+  Force-grouped detection/clip metadata intentionally remains raw and filtered;
+  it is not promoted into a second canonical GPS stream.
+- The standalone gopro-gps CLI consumes canonical GPS5/GPS9 points (all packet
+  rows), converting km/h back to m/s for CSV/GPX. Canonical data has no 3D speed:
+  the existing CSV column is left empty, not filled with 2D speed or zero. KML
+  exports coordinates unchanged. The old raw-i32-only CLI path is replaced,
+  since normal GoPro parsing now always canonicalizes supported GPS5/9 rows.
+- DOP is intentionally not added or extracted here; Task 5 owns that change.
+  No real-media/consumer build compatibility claim is made by synthetic tests.
+
 ## Feature 3：DOP 字段与序列化
 
 在 `src/tags_impl.rs::GpsData` 保留 `pub dop: Option<f64>`。按用户最终选择，字段名为 dop，None 序列化为 JSON null，不使用 skip_serializing_if。
@@ -93,3 +144,48 @@ GPS9 从列 7 按对应 SCAL 解码；零值/未知值策略由用例固定。GP
 运行库测试、可选 sony-xml 测试、GoPro wire-format/规范化/DOP 回归、DJI 消费契约、Python 和 WASM 的独立 manifest 检查/构建、真实样例与 rimecut-public 集成检查。根目录 cargo test --all 不会自动覆盖所有独立 bin crate。FFmpeg native 依赖工具、缺失平台工具链或真实样例的检查分别记录为未验证，不以绿色根测试替代。
 
 本设计不承诺工具链、消费方和媒体样例尚未取得时即可完成发布。
+
+### Task 5 implementation decisions and verification (2026-11-10)
+
+- Canonical `GpsData` now serializes `dop` unconditionally: missing values are
+  JSON null, present values are numbers. The field is dimensionless DOP, not a
+  claim of HDOP/PDOP. Adding a public field breaks external exhaustive Rust
+  struct literals; `Option`/`Default` do not remove that source compatibility cost.
+- GPS9 column 7 honors a positive finite SCAL divisor (column 7 or the
+  common scalar). Absent SCAL retains the old fork's compatibility default of
+  100; an explicitly invalid divisor or a partial SCAL missing column 7 yields
+  None. The quotient must be positive and finite. An invalid optional DOP retains the point with None; other
+  nonfinite row cells retain Task 4's row-rejection behavior. GPS5, CAMM,
+  Insta360 and Gyroflow set None. Tests cover integer/heterogeneous single/multi
+  rows, custom scales, zero/negative/nonfinite values and divisors, overflow,
+  and serialization. All canonical struct literals were checked with rg;
+  `gyroflow_proto::GpsData` is a separate generated protobuf type, unchanged.
+- Read-only rimecut-public inspection at
+  `37db9e37dc8359371ad1261766226b2d264c9573`: `extract_gps` copies `gps.dop`
+  directly into `GpsPoint`. Rust/TS type comments and the map picker call it
+  positional DOP/PDOP, not HDOP. No conversion or protocol proof of that
+  narrower label was found. GpsPoint omits absent DOP in its own JSON via
+  skip_serializing_if; that consumer boundary differs intentionally from this
+  crate's null contract. No consumer files changed or consumer build claimed.
+  The previously documented km/h-to-m/s integration blocker still applies.
+- WASM numeric projections now share a typed `Vec_GpsData` reading helper:
+  `tags()` includes dop even when the first reading is missing it; `series`
+  and `telemetry_flat` retain that slot as NaN. Canonical GPS readings have
+  eight numeric channels (including the acquired boolean); mixed None/Some
+  DOP cannot change widths or channel order. Only canonical GPS's optional
+  dop receives this handling; arbitrary JSON nulls (even named dop) still
+  produce no numeric channel. Ordinary telemetry JSON retains dop:null.
+  Host-manifest pure-function tests cover missing->present, present->missing,
+  all-missing, first-reading channel metadata, flat widths and null isolation.
+  The new projection regression failed before the helper implementation
+  (7 versus 8 channels), then passed. This does not claim browser JS runtime
+  validation or resolve the consumer speed-unit release blocker.
+- rustc 1.93.1: the default-null regression first failed because the field was
+  absent. After implementation `cargo test --locked` passed (56 passed,
+  1 ignored), and `cargo test --locked --features sony-xml` passed (57 passed,
+  1 ignored). Python and wasm32-unknown-unknown manifests passed locked checks.
+  gopro-gps and gyro2bb passed offline checks with temporary refreshed lockfiles
+  restored byte-for-byte afterwards; their locked checks require lock refresh.
+  gyroflow_proto_convert/inject locked checks likewise require lock refresh;
+  offline retries stopped on uncached simplelog 0.12.2 / bindgen 0.73.2.
+  No release/consumer/real-media runtime validation is claimed.

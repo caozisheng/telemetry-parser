@@ -89,7 +89,7 @@ macro_rules! declare_ids {
                 Ok(match s {
                     $(stringify!($field) => TagId::$field,)*
                     "*" => TagId::Any,
-                    _ if s.starts_with("0x") => TagId::Unknown(s.parse::<u32>()?),
+                    _ if s.starts_with("0x") => TagId::Unknown(u32::from_str_radix(&s[2..], 16)?),
                     _ => TagId::Custom(s.to_string().into())
                 })
             }
@@ -357,11 +357,7 @@ pub struct GpsData {
     pub speed: f64, // in km/h
     pub track: f64,
     pub altitude: f64, // in m
-    /// Positional Dilution of Precision (GPMF GPS9 col 7 / 100).
-    /// `None` when the source doesn't emit it (GPS5 legacy, CAMM,
-    /// some Insta360 firmware). Lower = better; typical driving-
-    /// quality fix is < 5, precision surveying < 2.
-    pub dop: Option<f64>,
+    pub dop: Option<f64>, // dimensionless dilution of precision; not necessarily HDOP
 }
 
 #[macro_export]
@@ -382,3 +378,21 @@ macro_rules! tag {
 
 pub type TagMap = BTreeMap<TagId, TagDescription>;
 pub type GroupedTagMap = BTreeMap<GroupId, TagMap>;
+
+#[cfg(test)]
+mod gps_data_tests {
+    use super::GpsData;
+
+    #[test]
+    fn gps_data_some_dop_serializes_as_number() {
+        let gps = GpsData { dop: Some(1.0), ..Default::default() };
+        let json = serde_json::to_value(gps).unwrap();
+        assert_eq!(json.get("dop"), Some(&serde_json::json!(1.0)));
+    }
+
+    #[test]
+    fn gps_data_default_serializes_dop_as_null() {
+        let json = serde_json::to_value(GpsData::default()).unwrap();
+        assert_eq!(json.get("dop"), Some(&serde_json::Value::Null));
+    }
+}
